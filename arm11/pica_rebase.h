@@ -1,17 +1,3 @@
-/* Why citro3d games drew nothing (or modern art) on New 3DS.
- *
- * citro3d tells the GPU "vertex buffers live at 0x18000000 + offset". On real
- * hardware a homebrew linear heap never gets anywhere near 0x28000000, so the
- * offsets stay small. We put the linear heap at 0x2D000000, the offsets got
- * huge, didn't fit the register, and the GPU went shopping for triangles in
- * memory that isn't even RAM. Clears and screen copies use absolute addresses,
- * so those kept working, which made this extra fun to find.
- *
- * Fix: right before the GPU sees a command list, move the base up to
- * 0x28000000 and shrink every offset by the same amount. Same bytes, smaller
- * numbers. It's safe to run twice on the same list (a rebased base means
- * "already done"), and it only happens on the New 3DS layout. */
-
 #ifndef X3_PICA_REBASE_H
 #define X3_PICA_REBASE_H
 
