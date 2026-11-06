@@ -6,4 +6,6 @@ bool title_path(const char *target,const char *leaf,char out[256]);
 bool title_prepare(const char *target);
 bool title_plugin_read(const char *target,bool fallback);
 bool title_plugin_write(const char *target,bool enabled);
+unsigned title_fps_read(const char *target);
+bool title_fps_write(const char *target,unsigned fps);
 #endif

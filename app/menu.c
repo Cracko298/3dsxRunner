@@ -148,7 +148,7 @@ int menu_install_ex(const char *source, const char *directory, const MenuInfo *i
   old_name[count]=0;
   if (!count) strcpy(old_name,"Homebrew");
   if (target[0]!='/' || strlen(target)>=sizeof existing) {
-    snprintf(note,capacity,"The homebrew path is too long or invalid.");
+    snprintf(note,capacity,"The software's path is too long or invalid.");
     return 0;
   }
   bool replacing=false, found=false;

@@ -8,6 +8,8 @@
 #include <unistd.h>
 
 #include "fsbridge.h"
+#include "sysnand.h"
+#include <stdlib.h>
 
 #ifndef BUF_PTR
 #define BUF_PTR(pa, size) ((void *)(pa))
@@ -84,6 +86,16 @@ void fsbridge_do(JobFs *f) {
     if (f->flags & 4u)
       fl |= O_CREAT;
     int fd = open(f->path, fl, 0666);
+    if (fd < 0 && errno == ENOENT && !(f->flags & 2u) && !strncmp(f->path, "/Aurora/sysdata/", 16) &&
+        strlen(f->path) == 16 + 16 + 6 && !strcmp(f->path + 32, ".romfs")) {
+      char hex[17];
+      memcpy(hex, f->path + 16, 16);
+      hex[16] = 0;
+      const char *why = sysnand_dump(strtoull(hex, NULL, 16), f->path);
+      snprintf(f->path2, sizeof f->path2, "%s", why ? why : "copied from the system NAND");
+      if (!why)
+        fd = open(f->path, fl, 0666);
+    }
     if (fd < 0) {
       f->result = result_of(errno);
       break;

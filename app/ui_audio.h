@@ -6,6 +6,7 @@ void ui_audio_init(void);
 void ui_audio_resume(void);
 void ui_audio_suspend(void);
 void ui_audio_toggle(void);
+void ui_audio_refresh(void);
 void ui_audio_tick(void);
 bool ui_audio_enabled(void);
 void ui_sound(int effect);

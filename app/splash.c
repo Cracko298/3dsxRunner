@@ -28,7 +28,7 @@ static void draw(unsigned shade) {
               96, FONT_TITLE, white, "3dsxRunner");
   }
   const char *label = installing ? (complete ? "Added to Home Menu" : "Adding to Home Menu")
-                                : (preparing ? "Preparing homebrew" : "Loading homebrew");
+                                : (preparing ? "Preparing software" : "Loading software");
   gfx_print(SCREEN_BOTTOM, (320-gfx_text_width(FONT_REGULAR,label))/2,
             88, FONT_REGULAR, white, "%s", label);
   gfx_rect(SCREEN_BOTTOM, 48, 124, 224, 5, RGB(shade/6,shade/6,shade/6));

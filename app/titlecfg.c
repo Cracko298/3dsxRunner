@@ -1,3 +1,4 @@
+#include <stdlib.h>
 #include "titlecfg.h"
 #include <stdio.h>
 #include <string.h>
@@ -41,13 +42,13 @@ bool title_plugin_read(const char *target,bool fallback) {
   int c=fgetc(f),tail=fgetc(f); fclose(f);
   return tail==EOF && (c=='0'||c=='1') ? c=='1' : fallback;
 }
-bool title_plugin_write(const char *target,bool enabled) {
+static bool write_setting(const char *target,const char *leaf,const char *value) {
   char path[256],tmp[264],backup[264];
-  if(!title_prepare(target) || !title_path(target,"plugin.cfg",path)) return false;
+  if(!title_prepare(target) || !title_path(target,leaf,path)) return false;
   snprintf(tmp,sizeof tmp,"%s.tmp",path); snprintf(backup,sizeof backup,"%s.bak",path);
   struct stat st; if(!stat(tmp,&st) || !stat(backup,&st)) return false;
   FILE *f=fopen(tmp,"wb"); if(!f) return false;
-  bool ok=fputc(enabled?'1':'0',f)!=EOF;
+  bool ok=fputs(value,f)!=EOF;
   if(fclose(f)) ok=false;
   bool prior=!stat(path,&st);
   if(ok && prior && rename(path,backup)) ok=false;
@@ -55,4 +56,24 @@ bool title_plugin_write(const char *target,bool enabled) {
   if(ok && prior) remove(backup);
   if(!ok) remove(tmp);
   return ok;
+}
+bool title_plugin_write(const char *target,bool enabled) {
+  return write_setting(target,"plugin.cfg",enabled?"1":"0");
+}
+unsigned title_fps_read(const char *target) {
+  char path[256],text[8]={0};
+  if(!title_path(target,"fps.cfg",path)) return 0;
+  FILE *f=fopen(path,"rb"); if(!f) return 0;
+  size_t n=fread(text,1,sizeof text-1,f); fclose(f); text[n]=0;
+  unsigned fps=(unsigned)atoi(text);
+  return fps==60 || fps==45 || fps==30 || fps==20 || fps==15 ? fps : 0;
+}
+bool title_fps_write(const char *target,unsigned fps) {
+  char path[256];
+  if(fps!=60 && fps!=45 && fps!=30 && fps!=20 && fps!=15) {
+    if(title_path(target,"fps.cfg",path)) remove(path);
+    return true;
+  }
+  char value[4]; snprintf(value,sizeof value,"%u",fps);
+  return write_setting(target,"fps.cfg",value);
 }

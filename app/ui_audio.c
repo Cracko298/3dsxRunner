@@ -2,6 +2,7 @@
 #include "audio.h"
 #include "gcadpcm.h"
 #include "ui_audio.h"
+#include "settings.h"
 #include <stdio.h>
 
 extern void app_core_post(uint32_t cmd,uint32_t a0,uint32_t a1,uint32_t a2,uint32_t a3);
@@ -66,7 +67,7 @@ void ui_audio_resume(void) {
     int16_t *pcm=(int16_t *)(uintptr_t)(AUDIO_PCM_ADDR+used);
     if(!gcadpcm_decode(data,bytes,pcm,info.samples)) return;
     for(size_t k=0;k<info.samples;k++) {
-      int32_t v=pcm[k]*3/2;
+      int32_t v=pcm[k]*(int32_t)settings.menu_volume/100;
       pcm[k]=(int16_t)(v>32767?32767:v<-32768?-32768:v);
     }
     decoded[i].address=AUDIO_PCM_ADDR+(uint32_t)used;
@@ -76,7 +77,12 @@ void ui_audio_resume(void) {
   os_cache_sync();
   loaded=true;
   ducked=false; music_volume=MUSIC_VOLUME;
-  play(0,true,MUSIC_VOLUME);
+  if(settings.menu_music) play(0,true,MUSIC_VOLUME);
+}
+void ui_audio_refresh(void) {
+  if(!enabled) return;
+  ui_audio_suspend();
+  ui_audio_resume();
 }
 void ui_audio_init(void) {
   char path[320]; snprintf(path,sizeof path,"%s/sound.cfg",app_dir());

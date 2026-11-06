@@ -15,7 +15,11 @@
 #include "ui_audio.h"
 #include "overlay.h"
 #include "titlecfg.h"
+#include "settings.h"
+#include "ncch.h"
+#include "cstick.h"
 
+#include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -45,6 +49,18 @@ static CoreLink core = {
   .micros=link_micros
 };
 
+static char program_services[700];
+
+static void stamp(char *out, size_t cap, bool for_file) {
+  SysTime t;
+  if (!sys_time(&t)) {
+    snprintf(out, cap, for_file ? "unknown-time" : "time unknown");
+    return;
+  }
+  snprintf(out, cap, for_file ? "%04d-%02d-%02d_%02d-%02d" : "%04d-%02d-%02d %02d:%02d",
+           t.year, t.month, t.day, t.hour, t.minute);
+}
+
 static void write_crash(FILE *f) {
   if (job->yield!=YIELD_CRASH) return;
   const JobCrash *c=&job->crash;
@@ -54,6 +70,15 @@ static void write_crash(FILE *f) {
           (unsigned long)c->cpsr,(unsigned long)c->far,(unsigned long)c->fsr);
   for (unsigned i=0;i<13;i++) fprintf(f,"r%u=%08lX%c",i,(unsigned long)c->r[i],i%4==3?'\n':' ');
   fputc('\n',f);
+  fprintf(f,"thread entry=%08lX\ncode at %08lX:",(unsigned long)c->entry,(unsigned long)((c->r[15]&~3u)-32u));
+  for (unsigned i=0;i<12;i++) fprintf(f,"%s%08lX",i==8?" >":" ",(unsigned long)c->code[i]);
+  fprintf(f,"\nstack:");
+  for (unsigned i=0;i<20;i++) fprintf(f,"%s%08lX",i%10?" ":"\n  ",(unsigned long)c->stack[i]);
+  fprintf(f,"\nlast requests (oldest first):\n");
+  for (unsigned i=0;i<8;i++)
+    if (c->recent[i].header)
+      fprintf(f,"  thread %lu: %.8s 0x%lX (header %08lX)\n",(unsigned long)c->recent[i].thread,
+              c->recent[i].svc,(unsigned long)(c->recent[i].header>>16),(unsigned long)c->recent[i].header);
 }
 
 static void exit_trace(const char *stage, bool fresh) {
@@ -62,10 +87,12 @@ static void exit_trace(const char *stage, bool fresh) {
   FILE *f=fopen(path,fresh?"w":"a");
   if (!f) return;
   bool idle=corelink_idle(&core);
-  fprintf(f,"r14b %lu ms: %s; HOME=%u seq=%lu ack=%lu idle=%u\n",
-          (unsigned long)sys_millis(),stage,core.home_pending,
+  char when[24];
+  stamp(when,sizeof when,false);
+  fprintf(f,"r16u %s, %lu ms: %s; HOME=%u seq=%lu ack=%lu idle=%u\n",
+          when,(unsigned long)sys_millis(),stage,core.home_pending,
           (unsigned long)ctrl->cmd_seq,(unsigned long)ctrl->ack_seq,idle);
-  if (fresh) fprintf(f,"%s\n",active_path);
+  if (fresh) fprintf(f,"%s\n%s",active_path,program_services);
   if (idle && supervisor_started) {
     fprintf(f,"cmd=%lu done=%lu yield=%lu gx=%lu LCD-pending=%lu error=%.127s\n",
             (unsigned long)job->cmd,(unsigned long)job->done,
@@ -84,8 +111,6 @@ static void exit_trace(const char *stage, bool fresh) {
   fclose(f);
 }
 
-/* Never let SDK cleanup scribble over the mailbox while the ARM11 might still
- * be using it. If it answers late, great. If not, we wait. */
 static void await_safe_core(void) {
   if (corelink_idle(&core)) return;
   exit_trace("core.unresponsive: waiting; no commands overwritten",false);
@@ -166,12 +191,17 @@ static void stop_guest(void) {
   display_allocation=NULL;
 }
 
+static const void *active_entry;
+static void save_active_log(void);
+
 static void leave(void) {
   leaving=true;
   core.loading_tick=NULL;
   exit_trace("leave.begin",false);
   await_safe_core();
   stop_guest();
+  fsbridge_close_all();
+  save_active_log();
   splash_end(false);
   ui_audio_suspend();
   await_safe_core();
@@ -189,7 +219,11 @@ typedef struct {
   char author[64];
   uint32_t size;
   uint16_t *icon;
+  uint8_t kind;
 } Entry;
+
+enum { KIND_3DSX, KIND_3DS, KIND_CIA, KIND_CXI, KINDS };
+static const char *const kind_names[KINDS] = {"3DSX", "3DS", "CIA", "CXI"};
 
 static Entry *entries;
 static int n_entries, cap_entries, sel, scroll;
@@ -219,7 +253,9 @@ static void add_entry(const char *path, uint32_t size) {
     return;
   uint8_t hdr[0x2C];
   size_t got = fread(hdr, 1, sizeof hdr, f);
-  if (got < 0x20 || memcmp(hdr, "3DSX", 4)) {
+  NcchInfo ncch = {0};
+  bool packaged = got < 0x20 || memcmp(hdr, "3DSX", 4);
+  if (packaged && !ncch_open(f, &ncch, NULL, 0)) {
     fclose(f);
     return;
   }
@@ -236,18 +272,30 @@ static void add_entry(const char *path, uint32_t size) {
   memset(e, 0, sizeof *e);
   snprintf(e->path, sizeof e->path, "%s", path);
   e->size = size;
+  {
+    size_t n = strlen(path);
+    e->kind = n > 4 && !strcasecmp(path + n - 4, ".cia") ? KIND_CIA
+            : n > 4 && !strcasecmp(path + n - 4, ".cxi") ? KIND_CXI
+            : n > 4 && !strcasecmp(path + n - 4, ".3ds") ? KIND_3DS : KIND_3DSX;
+  }
   const char *base = strrchr(path, '/');
   snprintf(e->title, sizeof e->title, "%s", base ? base + 1 : path);
   char *dot = strrchr(e->title, '.');
   if (dot)
     *dot = 0;
   uint16_t header_size = (uint16_t)(hdr[4] | hdr[5] << 8);
-  if (got >= 0x2C && header_size > 0x20) {
+  static uint8_t s[0x36C0];
+  bool have_smdh = false;
+  if (packaged) {
+    have_smdh = ncch_smdh(f, &ncch, s);
+  } else if (got >= 0x2C && header_size > 0x20) {
     uint32_t smdh = hdr[0x20] | hdr[0x21] << 8 | hdr[0x22] << 16 | (uint32_t)hdr[0x23] << 24;
     uint32_t smdh_size = hdr[0x24] | hdr[0x25] << 8 | hdr[0x26] << 16 | (uint32_t)hdr[0x27] << 24;
-    static uint8_t s[0x36C0];
-    if (smdh && smdh_size >= sizeof s && !fseek(f, (long)smdh, SEEK_SET) && fread(s, 1, sizeof s, f) == sizeof s &&
-        !memcmp(s, "SMDH", 4)) {
+    have_smdh = smdh && smdh_size >= sizeof s && !fseek(f, (long)smdh, SEEK_SET) &&
+                fread(s, 1, sizeof s, f) == sizeof s && !memcmp(s, "SMDH", 4);
+  }
+  {
+    if (have_smdh) {
       const uint8_t *t = s + 8 + 1 * 0x200;
       utf16_to_utf8((const uint16_t *)(const void *)t, 0x40, e->title, sizeof e->title);
       utf16_to_utf8((const uint16_t *)(const void *)(t + 0x180), 0x40, e->author, sizeof e->author);
@@ -262,49 +310,71 @@ static void add_entry(const char *path, uint32_t size) {
   n_entries++;
 }
 
-static bool ends_3dsx(const char *name) {
-  size_t n = strlen(name);
-  return n > 5 && !strcasecmp(name + n - 5, ".3dsx");
+static bool has_ext(const char *name, const char *ext) {
+  size_t n = strlen(name), k = strlen(ext);
+  return n > k && !strcasecmp(name + n - k, ext);
+}
+static bool ends_3dsx(const char *name) { return has_ext(name, ".3dsx") || has_ext(name, ".3ds"); }
+static bool ends_packaged(const char *name) {
+  return has_ext(name, ".cia") || has_ext(name, ".cxi") || has_ext(name, ".3ds");
 }
 
 static int by_title(const void *a, const void *b) {
   const Entry *x = a, *y = b;
+  if (settings.group_by_type && x->kind != y->kind)
+    return (int)x->kind - (int)y->kind;
   return strcasecmp(x->title, y->title);
 }
 
-static void scan(void) {
-  for (int i=0;i<n_entries;i++) free(entries[i].icon);
-  free(entries); entries=NULL; n_entries=cap_entries=sel=scroll=0;
-  FsDir *d = fs_dir_open("/3ds");
+static int folder = -1, fsel;
+static bool grouped(void) { return settings.group_by_type && n_entries; }
+static int kind_lo(int k) { int i = 0; while (i < n_entries && entries[i].kind < k) i++; return i; }
+static int kind_hi(int k) { int i = kind_lo(k); while (i < n_entries && entries[i].kind == k) i++; return i; }
+static int roots(int out[KINDS]) {
+  int n = 0;
+  for (int k = 0; k < KINDS; k++) if (kind_hi(k) > kind_lo(k)) out[n++] = k;
+  return n;
+}
+static void range(int *lo, int *hi) {
+  if (grouped() && folder >= 0) *lo = kind_lo(folder), *hi = kind_hi(folder);
+  else *lo = 0, *hi = n_entries;
+}
+static void open_folder_of(int i) {
+  if (!grouped() || i < 0 || i >= n_entries) return;
+  folder = entries[i].kind;
+  int r[KINDS], n = roots(r);
+  for (int j = 0; j < n; j++) if (r[j] == folder) fsel = j;
+  sel = scroll = i;
+}
+static void resort(void) {
+  if (!n_entries) return;
+  char keep[200];
+  snprintf(keep, sizeof keep, "%s", entries[sel].path);
+  qsort(entries, (size_t)n_entries, sizeof *entries, by_title);
+  folder = -1;
+  for (int i = 0; i < n_entries; i++) if (!strcmp(entries[i].path, keep)) { sel = scroll = i; break; }
+  if (grouped()) open_folder_of(sel), folder = -1;
+}
+
+static void scan_dir(const char *dir, bool (*wanted)(const char *)) {
+  FsDir *d = fs_dir_open(dir);
   if (!d)
     return;
   FsEntry e;
   char path[200];
-  char (*subdirs)[96] = malloc(128 * 96);
-  int n_sub = 0;
-  while (fs_dir_read(d, &e)) {
-    if (!e.is_dir && ends_3dsx(e.name)) {
-      if(snprintf(path, sizeof path, "/3ds/%s", e.name)<(int)sizeof path)
-        add_entry(path, e.size);
-    } else if (e.is_dir && subdirs && n_sub < 128 && strlen(e.name) < 96) {
-      snprintf(subdirs[n_sub++], 96, "%s", e.name);
-    }
-  }
+  while (fs_dir_read(d, &e))
+    if (!e.is_dir && wanted(e.name) &&
+        snprintf(path, sizeof path, "%s/%s", dir, e.name) < (int)sizeof path)
+      add_entry(path, e.size);
   fs_dir_close(d);
-  for (int i = 0; i < n_sub; i++) {
-    snprintf(path, sizeof path, "/3ds/%s", subdirs[i]);
-    FsDir *s = fs_dir_open(path);
-    if (!s)
-      continue;
-    while (fs_dir_read(s, &e))
-      if (!e.is_dir && ends_3dsx(e.name)) {
-        char full[200];
-        if(snprintf(full, sizeof full, "/3ds/%s/%s", subdirs[i], e.name)<(int)sizeof full)
-          add_entry(full, e.size);
-      }
-    fs_dir_close(s);
-  }
-  free(subdirs);
+}
+
+static void scan(void) {
+  for (int i=0;i<n_entries;i++) free(entries[i].icon);
+  free(entries); entries=NULL; n_entries=cap_entries=sel=scroll=0; folder=-1; fsel=0;
+  scan_dir("/3ds", ends_3dsx);
+  scan_dir("/cias", ends_packaged);
+  scan_dir("/cia", ends_packaged);
   AppCatalog installed={0};
   apps_scan(&installed,"/Aurora/Apps");
   for (int i=0;i<n_entries;i++) for (size_t j=0;j<installed.count;j++) {
@@ -343,12 +413,22 @@ static void draw_icon(const uint16_t *icon, int x0, int y0, int scale) {
 
 static void draw_top(const char *note) {
   gfx_rect(SCREEN_TOP, 0, 0, 400, 240, BG);
-  gfx_print(SCREEN_TOP, 16, 12, FONT_TITLE, COLOR_WHITE, "3DSX Runner r14b");
-  gfx_print(SCREEN_TOP, 18 + gfx_text_width(FONT_TITLE, "3DSX Runner r14b"), 18, FONT_SMALL, DIM,
-            "libctru homebrew on AuroraOS");
+  gfx_print(SCREEN_TOP, 16, 12, FONT_TITLE, COLOR_WHITE, "3DSX Runner r16u");
+  gfx_print(SCREEN_TOP, 18 + gfx_text_width(FONT_TITLE, "3DSX Runner r16u"), 18, FONT_SMALL, DIM,
+            "3DS software on AuroraOS");
   if (!n_entries) {
     gfx_print(SCREEN_TOP, 16, 70, FONT_REGULAR, COLOR_WHITE,
-              "No .3dsx programs were found.\n\nPut them in SD:/3ds, or in their own folders\ninside it, as the Homebrew Launcher keeps them.");
+              "No software was found.\n\nPut .3dsx and .3ds files in SD:/3ds, and unencrypted\n.cia, .cxi and .3ds files in SD:/cias (or SD:/cia).");
+  } else if (grouped() && folder < 0) {
+    int r[KINDS], n = roots(r);
+    int k = r[fsel < n ? fsel : 0];
+    gfx_round_rect(SCREEN_TOP, 12, 48, 376, 120, 10, PANEL);
+    gfx_round_rect(SCREEN_TOP, 24, 60, 96, 96, 12, accent());
+    gfx_print(SCREEN_TOP, 72 - gfx_text_width(FONT_TITLE, kind_names[k]) / 2, 96, FONT_TITLE, COLOR_BLACK, "%s",
+              kind_names[k]);
+    gfx_print(SCREEN_TOP, 136, 64, FONT_BOLD, COLOR_WHITE, "%s files", kind_names[k]);
+    gfx_print(SCREEN_TOP, 136, 86, FONT_REGULAR, DIM, "%d in this folder", kind_hi(k) - kind_lo(k));
+    gfx_print(SCREEN_TOP, 136, 120, FONT_SMALL, DIM, "A: open   B: back out of a folder");
   } else {
     const Entry *e = &entries[sel];
     gfx_round_rect(SCREEN_TOP, 12, 48, 376, 120, 10, PANEL);
@@ -365,37 +445,52 @@ static void draw_top(const char *note) {
   if (note && note[0])
     gfx_print(SCREEN_TOP, 16, 178, FONT_SMALL, COLOR_YELLOW, "%s", note);
   gfx_print(SCREEN_TOP,16,210,FONT_SMALL,DIM,"A: start   X: no arguments   Y: add to menu   START: apps");
-  gfx_print(SCREEN_TOP,16,226,FONT_SMALL,DIM,"L + launch: cheats   SELECT: sound %s   HOME: exit",ui_audio_enabled()?"on":"off");
+  gfx_print(SCREEN_TOP,16,226,FONT_SMALL,DIM,grouped()&&folder>=0?"L + launch: cheats   B: back to folders   SELECT: settings":"L + launch: cheats   SELECT: settings   HOME: exit");
 }
 
 static void draw_bottom(void) {
   gfx_rect(SCREEN_BOTTOM, 0, 0, 320, 240, BG);
+  if (grouped() && folder < 0) {
+    int r[KINDS], n = roots(r);
+    for (int i = 0; i < n; i++) {
+      int y = 8 + i * (ROW_H + 2), k = r[i];
+      uint32_t ink = i == fsel ? COLOR_BLACK : COLOR_WHITE;
+      if (i == fsel)
+        gfx_round_rect(SCREEN_BOTTOM, 6, y, 308, ROW_H, 6, accent());
+      gfx_print(SCREEN_BOTTOM, 14, y + 5, FONT_BOLD, ink, "%s", kind_names[k]);
+      char count[16];
+      snprintf(count, sizeof count, "%d", kind_hi(k) - kind_lo(k));
+      gfx_print(SCREEN_BOTTOM, 300 - gfx_text_width(FONT_REGULAR, count), y + 5, FONT_REGULAR, ink, "%s", count);
+    }
+  } else {
+  int lo, hi;
+  range(&lo, &hi);
+  if (scroll < lo)
+    scroll = lo;
   if (sel < scroll)
     scroll = sel;
   if (sel >= scroll + ROWS)
     scroll = sel - ROWS + 1;
-  for (int i = 0; i < ROWS && scroll + i < n_entries; i++) {
+  for (int i = 0; i < ROWS && scroll + i < hi; i++) {
     int k = scroll + i, y = 8 + i * (ROW_H + 2);
     if (k == sel)
       gfx_round_rect(SCREEN_BOTTOM, 6, y, 308, ROW_H, 6, accent());
     gfx_print(SCREEN_BOTTOM, 14, y + 5, FONT_REGULAR, k == sel ? COLOR_BLACK : COLOR_WHITE, "%.36s",
               entries[k].title);
   }
+  }
   gfx_round_rect(SCREEN_BOTTOM,6,208,150,28,6,PANEL);
   gfx_round_rect(SCREEN_BOTTOM,164,208,150,28,6,PANEL);
   gfx_print(SCREEN_BOTTOM,16,216,FONT_SMALL,COLOR_WHITE,"START: Manage apps");
-  gfx_print(SCREEN_BOTTOM,174,216,FONT_SMALL,COLOR_WHITE,"SELECT: Sound %s",ui_audio_enabled()?"on":"off");
+  gfx_print(SCREEN_BOTTOM,174,216,FONT_SMALL,COLOR_WHITE,"SELECT: Settings");
 }
 
-static void save_log(const Entry *e, const char *outcome) {
-  char path[256];
-  snprintf(path, sizeof path, "%s/last-run.txt", app_dir());
-  FILE *f = fopen(path, "w");
-  if (!f)
-    return;
-  fprintf(f, "3DSX Runner r14b: %s\n%s\nSD:%s\n\n", outcome, e->title, e->path);
+static void write_log(FILE *f, const Entry *e, const char *outcome, const char *when) {
+  fprintf(f, "3DSX Runner r16u: %s\n%s\nSD:%s\n%s\n\n", outcome, e->title, e->path, when);
   fprintf(f, "kernel calls %u, service requests %u, GPU commands %u, time slices run out %u\n\n",
           (unsigned)job->svc_count, (unsigned)job->ipc_count, (unsigned)job->gx_count, (unsigned)job->preempts);
+  if (program_services[0])
+    fprintf(f, "%s\n", program_services);
   fprintf(f,"launch=%s; display=%08lX size=%lX; swaps=%lu/%lu\n",
           job->launch_flags&1u?"X/no-arguments":"A/path-argument",
           (unsigned long)job->display.pa,(unsigned long)job->display.size,
@@ -404,7 +499,81 @@ static void save_log(const Entry *e, const char *outcome) {
   uint32_t head = job->log_head, n = head < JOB_LOG_SIZE ? head : JOB_LOG_SIZE;
   for (uint32_t i = head - n; i != head; i++)
     fputc(job->log[i % JOB_LOG_SIZE], f);
-  fclose(f);
+  if (job->trace_pa && job->trace_size && job->trace_head) {
+    const char *t = (const char *)(uintptr_t)job->trace_pa;
+    uint32_t th = job->trace_head, tn = th < job->trace_size ? th : job->trace_size;
+    fprintf(f, "\n---- detailed log%s ----\n", th > job->trace_size ? " (most recent part)" : "");
+    for (uint32_t i = th - tn; i != th; i++)
+      fputc(t[i % job->trace_size], f);
+  }
+}
+
+static void save_log(const Entry *e, const char *outcome) {
+  char path[300], when[24], file_when[24], name[48];
+  active_entry = NULL;
+  stamp(when, sizeof when, false);
+  stamp(file_when, sizeof file_when, true);
+  size_t k = 0;
+  for (const char *c = e->title; *c && k + 1 < sizeof name; c++) {
+    unsigned char ch = (unsigned char)*c;
+    if (ch < 0x20 || strchr("\\/:*?\"<>|", ch))
+      ch = ' ';
+    if (ch == ' ' && (!k || name[k - 1] == ' '))
+      continue;
+    name[k++] = (char)ch;
+  }
+  while (k && (name[k - 1] == ' ' || name[k - 1] == '.'))
+    k--;
+  name[k] = 0;
+  char dir[200];
+  bool packaged = !strncmp(e->path, "/cias/", 6) || !strncmp(e->path, "/cia/", 5);
+  if (packaged) {
+    if ((job->launch_flags & 4u) && job->save_dir[0]) snprintf(dir, sizeof dir, "%s", job->save_dir);
+    else snprintf(dir, sizeof dir, "/Aurora/Apps/C/%s", k ? name : "untitled");
+    fs_mkdir("/Aurora/Apps");
+    fs_mkdir("/Aurora/Apps/C");
+    fs_mkdir(dir);
+    snprintf(dir + strlen(dir), sizeof dir - strlen(dir), "/Logs");
+  } else {
+    snprintf(dir, sizeof dir, "%s/runs", app_dir());
+  }
+  fs_mkdir(dir);
+  for (int n = 1; n < 100; n++) {
+    if (n == 1)
+      snprintf(path, sizeof path, "%s/%s %s.txt", dir, file_when, k ? name : "untitled");
+    else
+      snprintf(path, sizeof path, "%s/%s %s (%d).txt", dir, file_when, k ? name : "untitled", n);
+    FILE *probe = fopen(path, "r");
+    if (!probe)
+      break;
+    fclose(probe);
+  }
+  FILE *f = fopen(path, "w");
+  bool copied = false;
+  int err = f ? 0 : errno;
+  if (f) {
+    write_log(f, e, outcome, when);
+    copied = fclose(f) == 0;
+    if (!copied) err = errno;
+  }
+  {
+    char line[360];
+    snprintf(line, sizeof line, copied ? "log saved: SD:%s" : "log NOT saved: SD:%s (error %d)", path, err);
+    exit_trace(line, false);
+  }
+  char last[300];
+  snprintf(last, sizeof last, "%s/last-run.txt", app_dir());
+  f = fopen(last, "w");
+  if (f) {
+    write_log(f, e, outcome, when);
+    if (copied) fprintf(f, "\n(also saved as SD:%s)\n", path);
+    else fprintf(f, "\n(couldn't save a copy as SD:%s)\n", path);
+    fclose(f);
+  }
+}
+
+static void save_active_log(void) {
+  if (active_entry) save_log((const Entry *)active_entry, "you pressed HOME");
 }
 
 static void show_log(void) {
@@ -487,10 +656,103 @@ static bool loading_progress(size_t done, size_t total) {
   return true;
 }
 
+static uint32_t program_romfs;
+static bool program_retail;
+static uint32_t program_stack, program_kernel;
+static NcchInfo program_ncch;
+static uint64_t program_title;
+static char program_name[64];
+
+static void describe_services(const NcchInfo *n) {
+  static const char *const have[] = {
+    "srv:", "APT:U", "APT:S", "APT:A", "gsp::Gpu", "hid:USER", "hid:SPVR", "ir:rst", "fs:USER",
+    "cfg:u", "cfg:s", "cfg:i", "ptm:u", "ptm:sysm", "ptm:gets", "ptm:sets", "ptm:s", "ptm:play",
+    "ac:u", "ac:i", "dsp::DSP", "mic:u", "http:C",
+  };
+  char names[34][9];
+  int count = ncch_services(n, names);
+  char yes[34 * 9 + 1] = "", no[34 * 9 + 1] = "";
+  for (int i = 0; i < count; i++) {
+    bool real = false;
+    for (unsigned k = 0; k < sizeof have / sizeof have[0]; k++)
+      if (!strcmp(names[i], have[k])) real = true;
+    char *dst = real ? yes : no;
+    size_t len = strlen(dst), k = strlen(names[i]);
+    dst[len] = ' ';
+    memcpy(dst + len + 1, names[i], k + 1);
+  }
+  snprintf(program_services, sizeof program_services,
+           "services the title may use (%d):\n  implemented:%s\n  stand-in (answers OK):%s\n",
+           count, yes[0] ? yes : " none", no[0] ? no : " none");
+}
+static void save_folder(char *out, size_t cap) {
+  char name[64];
+  size_t k = 0;
+  for (const char *c = program_name; *c && k + 1 < sizeof name; c++) {
+    unsigned char ch = (unsigned char)*c;
+    if (ch < 0x20 || strchr("\\/:*?\"<>|", ch))
+      ch = ' ';
+    if (ch == ' ' && (!k || name[k - 1] == ' '))
+      continue;
+    name[k++] = (char)ch;
+  }
+  while (k && (name[k - 1] == ' ' || name[k - 1] == '.'))
+    k--;
+  name[k] = 0;
+  if (!k)
+    snprintf(name, sizeof name, "%016llX", (unsigned long long)program_title);
+  snprintf(out, cap, "/Aurora/Apps/C/%s", name);
+}
+
 static uint8_t *read_program(const char *path, uint32_t *bytes, char *why, size_t cap) {
   FILE *f = fopen(path, "rb");
   uint8_t h[0x100];
-  if (!f || fread(h, 1, 0x20, f) != 0x20 || memcmp(h, "3DSX", 4)) {
+  program_romfs = 0;
+  program_retail = false;
+  program_stack = program_kernel = 0;
+  program_title = 0;
+  program_name[0] = 0;
+  program_services[0] = 0;
+  if (f && fread(h, 1, 0x20, f) == 0x20 && memcmp(h, "3DSX", 4)) {
+    NcchInfo n;
+    uint8_t *image = NULL;
+    if (ncch_open(f, &n, why, cap) && n.platform == 2 && !n3ds) {
+      snprintf(why, cap, "This game is made for the New 3DS only, so it can't run on this console.");
+      fclose(f);
+      return NULL;
+    }
+    if (n.ok) {
+      loading_progress(0, 1);
+      bool compressed;
+      int prm = 1;
+      if (ncch_code_size(&n, &compressed) > (4u << 20) && compressed)
+        image = ncch_build_packed(f, &n, bytes, &prm, why, cap);
+      else
+        image = ncch_build_3dsx(f, &n, bytes, why, cap);
+      program_romfs = image ? ncch_romfs_level3(f, &n) : 0;
+      bool packed = image && (image[0x0F] & 0x80u);
+      if (image && (packed ? prm != 1 : (*bytes >= 0x38 + 8 && memcmp(image + 0x38 + 4, "_prm", 4)))) {
+        program_retail = true;
+        program_stack = ncch_stack_size(&n);
+        program_kernel = ncch_kernel_version(&n);
+        program_title = n.title_id;
+        program_ncch = n;
+        describe_services(&n);
+        static uint8_t smdh[0x36C0];
+        if (ncch_smdh(f, &n, smdh))
+          utf16_to_utf8((const uint16_t *)(const void *)(smdh + 8 + 0x200), 0x40, program_name, sizeof program_name);
+      }
+      loading_progress(1, 1);
+    }
+    fclose(f);
+    if (image && *bytes > FILE_PA_LIMIT) {
+      snprintf(why, cap, "The program is too big to load (%u KB).", (unsigned)(*bytes >> 10));
+      free(image);
+      return NULL;
+    }
+    return image;
+  }
+  if (!f || memcmp(h, "3DSX", 4)) {
     snprintf(why, cap, "The file could not be read as a .3dsx.");
     if (f)
       fclose(f);
@@ -551,6 +813,13 @@ static void input(void) {
     job->touch_x = (uint32_t)hid_touch_x();
     job->touch_y = (uint32_t)hid_touch_y();
   }
+  if (n3ds) {
+    CStick c;
+    cstick_read(&c);
+    job->cstick_x = c.x;
+    job->cstick_y = c.y;
+    job->zlzr = (c.zl ? 1u : 0u) | (c.zr ? 2u : 0u);
+  }
 }
 
 static bool save_frame(const char *name, uint32_t pa, unsigned width) {
@@ -595,6 +864,7 @@ static bool present(void) {
 }
 
 static void start(const Entry *e, char *note, size_t cap, bool no_args, bool plugins, bool open_plugin) {
+  active_entry = NULL;
   ui_audio_suspend();
   await_safe_core();
   splash_begin(false);
@@ -617,10 +887,11 @@ static void start(const Entry *e, char *note, size_t cap, bool no_args, bool plu
   }
   await_safe_core();
   snprintf(active_path,sizeof active_path,"%s",e->path);
+  if (settings.remember_last && strcmp(settings.last,e->path)) {
+    snprintf(settings.last,sizeof settings.last,"%s",e->path);
+    settings_save();
+  }
   exit_trace("launch",true);
-  /* Every launch copies a fresh supervisor into place. Menu tiles carry their
-   * own copy of the whole runner, which is why they need Y / Add-update after
-   * an update. */
   memcpy((void *)JOB_CODE, sup_blob, (size_t)(sup_blob_end - sup_blob));
   memset(job, 0, sizeof *job);
   job->magic = JOB_MAGIC;
@@ -628,22 +899,54 @@ static void start(const Entry *e, char *note, size_t cap, bool no_args, bool plu
   job->file_pa = (uint32_t)file;
   job->file_size = bytes;
   job->display=(JobRegion){((uint32_t)display_allocation+0xFFFu)&~0xFFFu,DISPLAY_POOL_SIZE};
-  job->launch_flags = no_args ? 1u : 0u;
+  job->launch_flags = (no_args ? 1u : 0u) | (settings.detailed_logs ? 8u : 0u);
+  job->self_romfs = program_romfs;
+  if (program_retail) {
+    job->launch_flags |= 4u;
+    job->retail_stack = program_stack;
+    job->retail_kernel = program_kernel;
+    job->title_lo = (uint32_t)program_title;
+    job->title_hi = (uint32_t)(program_title >> 32);
+    save_folder(job->save_dir, sizeof job->save_dir);
+    char dir[128];
+    fs_mkdir("/Aurora/Apps");
+    fs_mkdir("/Aurora/Apps/C");
+    fs_mkdir(job->save_dir);
+    snprintf(dir, sizeof dir, "%s/SaveData", job->save_dir);
+    fs_mkdir(dir);
+    snprintf(dir, sizeof dir, "%s/ExtData", job->save_dir);
+    fs_mkdir(dir);
+  }
   {
     char sync_path[300];
-    /* The escape hatch: drop sync-gx.txt on the SD card to get the old
-     * synchronous GPU behaviour back. Please tell me if you ever need it. */
     snprintf(sync_path,sizeof sync_path,"%s/sync-gx.txt",app_dir());
     FILE *sync=fopen(sync_path,"r");
     if (sync) { job->launch_flags |= 2u; fclose(sync); }
+    if (settings.sync_gx) job->launch_flags |= 2u;
   }
   job->plugin_enabled=plugins;
   snprintf(job->path, sizeof job->path, "sdmc:%s", e->path);
-  /* Where the game lives. New 3DS: upper FCRAM, which Aurora leaves alone.
-   * Old 3DS: scratch below the OS's copy, plus the sound pool. Yes, the Old
-   * 3DS layout is tight. Coastline Chase's 9.6 MB of meshes don't fit, and I'm
-   * sorry. */
-  if (n3ds) {
+  bool big_mode = n3ds && (program_ncch.platform == 2 || ncch_code_size(&program_ncch, NULL) >= (3584u << 10));
+  job->retail_appmem = program_retail ? ncch_app_memory(&program_ncch, big_mode) : 0;
+  uint32_t appmem = job->retail_appmem & ~0xFu;
+  if (n3ds && program_retail && program_kernel >= 0x22Cu && appmem && appmem <= 0x06000000u) {
+    const uint8_t *x = program_ncch.exheader;
+    uint32_t pages = (x[0x14] | x[0x15] << 8 | x[0x16] << 16) + (x[0x24] | x[0x25] << 8 | x[0x26] << 16) +
+                     (x[0x34] | x[0x35] << 8 | x[0x36] << 16);
+    uint32_t bss = x[0x3C] | x[0x3D] << 8 | x[0x3E] << 16 | (uint32_t)x[0x3F] << 24;
+    uint32_t image = pages * 0x1000u + bss + program_stack + 0x100000u;
+    uint32_t code = ((image + 0xFFFFFu) & ~0xFFFFFu) + appmem;
+    if (code > 0x05000000u) code = 0x05000000u;
+    job->code = (JobRegion){0x28000000u, code};
+    job->linear = (JobRegion){0x28000000u + code, 0x08000000u - code};
+  } else if (n3ds && program_retail && program_kernel >= 0x22Cu && appmem > 0x06000000u) {
+    job->code = (JobRegion){0x28000000u, 0x08000000u};
+    job->linear = (JobRegion){0x28000000u, 0x08000000u};
+    job->launch_flags |= 0x10u;
+  } else if (n3ds && program_retail && program_kernel && program_kernel < 0x22Cu) {
+    job->code = (JobRegion){0x28000000u, 0x08000000u};
+    job->linear = (JobRegion){0x23400000u, 0x00A00000u};
+  } else if (n3ds) {
     job->code = (JobRegion){0x28000000u, 0x05000000u};
     job->linear = (JobRegion){0x2D000000u, 0x03000000u};
   } else {
@@ -659,8 +962,8 @@ static void start(const Entry *e, char *note, size_t cap, bool no_args, bool plu
 
   splash_preparing();
   core.loading_tick=splash_tick;
-  /* From here on, even HOME during loading needs a proper JOB_STOP. */
   supervisor_started=true;
+  active_entry = e;
   bool loaded = run(JOB_LOAD) && job->yield != YIELD_ERROR;
   core.loading_tick=NULL;
   free(file);
@@ -684,11 +987,10 @@ static void start(const Entry *e, char *note, size_t cap, bool no_args, bool plu
     if(open_plugin) going=show_overlay();
   }
 
-  /* Guest vblanks, timer wakeups and actual presents each get their own
-   * deadline. When they shared one, audio wakeups kept pushing the screen
-   * copy back forever (Coastline's famous blue screen, r6). */
   uint64_t t0 = sys_micros();
-  RunnerPacing pace;
+  RunnerPacing pace={0};
+  unsigned fps=title_fps_read(e->path);
+  runner_pacing_lock(&pace,fps?fps:settings.frame_lock);
   runner_pacing_init(&pace,t0);
   uint32_t last_scan = sys_millis();
   for (;going;) {
@@ -718,6 +1020,16 @@ static void start(const Entry *e, char *note, size_t cap, bool no_args, bool plu
       job->close_files = job->close_dirs = 0;
       httpbridge_drop(job->close_http);
       job->close_http = 0;
+      if (job->yield == YIELD_APPLET) {
+        extern bool applet_show(JobParams *job);
+        uint64_t pause_begin = sys_micros();
+        going = applet_show(job);
+        t0 += sys_micros() - pause_begin;
+        runner_pacing_init(&pace, sys_micros());
+        if (!going) break;
+        hid_scan(); input();
+        continue;
+      }
       if (job->yield == YIELD_HTTP) {
         httpbridge_do((JobHttp *)(uintptr_t)job->http_pa);
         hid_scan(); input();
@@ -779,7 +1091,8 @@ static void configure_launcher(Entry *entry,const InstalledApp *installed,char *
   }
   if(title_plugin_read(info.target,(info.flags&MENU_PLUGIN)!=0)) info.flags|=MENU_PLUGIN;
   else info.flags&=~MENU_PLUGIN;
-  if(!ui_install_popup(&info,entry?entry->icon:NULL,
+  unsigned fps=title_fps_read(info.target);
+  if(!ui_install_popup(&info,&fps,entry?entry->icon:NULL,
                        installed && installed->has_icon?installed->icon:NULL)) return;
   fs_mkdir(directory);
   splash_begin(true);
@@ -789,6 +1102,8 @@ static void configure_launcher(Entry *entry,const InstalledApp *installed,char *
   if(core.home_pending) exit(0);
   if(added && !title_plugin_write(info.target,(info.flags&MENU_PLUGIN)!=0))
     snprintf(note,cap,"Tile saved; could not save shared plugin setting.");
+  if(added && !title_fps_write(info.target,fps))
+    snprintf(note,cap,"Tile saved; could not save the frame lock.");
   if(added && entry) {
     snprintf(entry->title,sizeof entry->title,"%s",info.title);
     snprintf(entry->author,sizeof entry->author,"%s",info.author);
@@ -833,7 +1148,7 @@ static void manage_apps(char *note,size_t cap) {
 
 static void fatal(const char *why) {
   gfx_rect(SCREEN_TOP, 0, 0, 400, 240, BG);
-  gfx_print(SCREEN_TOP, 16, 16, FONT_TITLE, COLOR_WHITE, "3DSX Runner r14b");
+  gfx_print(SCREEN_TOP, 16, 16, FONT_TITLE, COLOR_WHITE, "3DSX Runner r16u");
   gfx_print(SCREEN_TOP, 16, 56, FONT_REGULAR, COLOR_WHITE, "%s", why);
   gfx_print(SCREEN_TOP, 16, 218, FONT_SMALL, DIM, "HOME: back to Aurora");
   for (;;)
@@ -845,6 +1160,7 @@ int main(void) {
   if (!app_from_home())
     fatal("Start the runner from Aurora (the Home Menu,\nFiles or the Terminal): programs run on the ARM11,\nwhich Aurora's core lends to the apps it starts.");
   os_cache_sync();
+  settings_load();
   if (ctrl->version < AUDIO_RUN11_VERSION) {
     snprintf(note, sizeof note, "This needs AuroraOS with ARM11 core %u or later\n(this one is %u). Copy a newer AURORAOS.BIN.",
              (unsigned)AUDIO_RUN11_VERSION, (unsigned)ctrl->version);
@@ -886,6 +1202,9 @@ int main(void) {
   }
   ui_audio_init();
   scan();
+  if (settings.remember_last && settings.last[0])
+    for (int i = 0; i < n_entries; i++)
+      if (!strcmp(entries[i].path, settings.last)) { sel = i; open_folder_of(i); break; }
 
   bool redraw = true;
   for (;;) {
@@ -902,24 +1221,57 @@ int main(void) {
       if(hid_touch_in(6,208,150,28)) down|=KEY_START;
       if(hid_touch_in(164,208,150,28)) down|=KEY_SELECT;
     }
-    if(down&KEY_SELECT) { ui_audio_toggle(); redraw=true; }
+    if(down&KEY_SELECT) {
+      bool was=settings.group_by_type;
+      ui_sound(UI_SELECT); ui_settings();
+      if(was!=settings.group_by_type) resort();
+      redraw=true; continue;
+    }
     if(down&KEY_START) {
       ui_sound(UI_SELECT); manage_apps(note,sizeof note); redraw=true; continue;
     }
     if (!n_entries)
       continue;
+    if (grouped() && folder < 0) {
+      int r[KINDS], n = roots(r), was = fsel;
+      if (down & (KEY_DOWN | KEY_CPAD_DOWN)) fsel = (fsel + 1) % n;
+      if (down & (KEY_UP | KEY_CPAD_UP)) fsel = (fsel + n - 1) % n;
+      if (hid_touch_down()) {
+        int row = (hid_touch_y() - 8) / (ROW_H + 2);
+        if (row >= 0 && row < n) {
+          if (row == fsel) down |= KEY_A;
+          fsel = row;
+        }
+      }
+      if (fsel != was) { ui_sound(UI_MOVE); note[0] = 0; redraw = true; }
+      if (down & KEY_A) {
+        ui_sound(UI_SELECT);
+        folder = r[fsel];
+        sel = scroll = kind_lo(folder);
+        redraw = true;
+      }
+      continue;
+    }
+    if (grouped() && (down & KEY_B)) {
+      ui_sound(UI_BACK);
+      folder = -1;
+      redraw = true;
+      continue;
+    }
+    int lo, hi;
+    range(&lo, &hi);
     int before = sel;
     if (down & (KEY_DOWN | KEY_CPAD_DOWN))
-      sel = (sel + 1) % n_entries;
+      sel = sel + 1 < hi ? sel + 1 : lo;
     if (down & (KEY_UP | KEY_CPAD_UP))
-      sel = (sel + n_entries - 1) % n_entries;
+      sel = sel > lo ? sel - 1 : hi - 1;
     if (down & (KEY_RIGHT | KEY_R))
-      sel = sel + ROWS < n_entries ? sel + ROWS : n_entries - 1;
+      sel = sel + ROWS < hi ? sel + ROWS : hi - 1;
     if (down & KEY_LEFT)
-      sel = sel >= ROWS ? sel - ROWS : 0;
+      sel = sel - ROWS >= lo ? sel - ROWS : lo;
     if (hid_touch_down()) {
       int row = (hid_touch_y() - 8) / (ROW_H + 2);
-      if (row >= 0 && row < ROWS && scroll + row < n_entries) {
+      if (row >= 0 && row < ROWS && scroll + row < hi) {
         if (scroll + row == sel)
           down |= KEY_A;
         sel = scroll + row;
