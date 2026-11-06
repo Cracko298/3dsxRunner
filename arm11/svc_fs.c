@@ -2,6 +2,9 @@
 
 #define SLOT  0
 #define FLAGS 1
+#define SELF  2
+#define BASE  3
+static bool self_path(const char *path);
 
 static struct {
   u32 id;
@@ -11,6 +14,9 @@ static struct {
   bool cached;
   bool bounce;
   u32 count;
+  u32 base;
+  u8 sysdata;
+  u32 slot;
 } pend;
 
 #define RA_SIZE 0x10000u
@@ -79,12 +85,56 @@ static bool get_path(u32 type, u32 size, u32 va, char *out, u32 cap) {
   return true;
 }
 
+#define ARCH_SELFNCCH 3u
+#define ARCH_SAVEDATA 4u
+#define ARCH_EXTDATA  6u
+#define ARCH_SHAREDEXT 7u
+#define ARCH_NCCH 0x2345678Au
+
+static struct { u32 lo, hi; } ncch_titles[8];
+static u32 binary_word(u32 type, u32 size, u32 va, u32 i) {
+  if (type != 2 || size < (i + 1) * 4 || !mmu_user_ok(va + i * 4, 4)) return 0;
+  return *(const u32 *)(uintptr_t)(va + i * 4);
+}
+
+static bool retail_title(void) { return (P->launch_flags & 4u) != 0; }
+
 static bool sd_archive(u32 lo, u32 hi) {
   (void)hi;
-  return lo == 9u || lo == 0xAu;
+  if (lo == 9u || lo == 0xAu) return true;
+  return retail_title() && (lo == ARCH_SAVEDATA || lo == ARCH_EXTDATA || lo == ARCH_SHAREDEXT);
+}
+
+static bool apath(u32 lo, u32 hi, u32 type, u32 size, u32 va, char *out, u32 cap) {
+  if (lo == 9u || lo == 0xAu) return get_path(type, size, va, out, cap);
+  if (!sd_archive(lo, hi)) return false;
+  const char *leaf = lo == ARCH_SAVEDATA ? "/SaveData" : "/ExtData";
+  char sub[256];
+  if (!get_path(type, size, va, sub, sizeof sub)) return false;
+  snprintf(out, cap, "%s%s%s", P->save_dir, leaf, (sub[0] == '/' && !sub[1]) ? "" : sub);
+  return true;
+}
+
+static struct { char path[72]; u32 reads, writes; u64 rbytes, wbytes; } fstat[32];
+
+static void trace_close(u32 slot) {
+  slot &= 31u;
+  if (!fstat[slot].path[0]) return;
+  trace_printf("fs: closed %s: %u reads (%llu bytes), %u writes (%llu bytes)\n", fstat[slot].path,
+               fstat[slot].reads, fstat[slot].rbytes, fstat[slot].writes, fstat[slot].wbytes);
+  fstat[slot].path[0] = 0;
 }
 
 static void issue(Thread *t, u32 op, void (*done)(Thread *t)) {
+  static const char *const names[] = {"", "open", "read", "write", "size", "set size", "close", "delete",
+                                      "rename", "make folder", "remove folder", "create", "open folder",
+                                      "read folder", "close folder", "check", "free space"};
+  if (tracing() && (op == FSOP_DELETE || op == FSOP_RENAME || op == FSOP_MKDIR || op == FSOP_RMDIR ||
+                    op == FSOP_CREATE || op == FSOP_OPENDIR)) {
+    if (op == FSOP_RENAME) trace_printf("fs: rename %s -> %s\n", P->fs.path, P->fs.path2);
+    else if (op == FSOP_CREATE) trace_printf("fs: create %s (%llu bytes)\n", P->fs.path, P->fs.value64);
+    else trace_printf("fs: %s %s\n", names[op], P->fs.path);
+  }
   P->fs.op = op;
   arm9_request(t, done);
 }
@@ -109,14 +159,126 @@ static void done_simple(Thread *t) {
   cmd[1] = (u32)P->fs.result;
 }
 
+static void finish_open(Thread *t);
+
+#define RES_FS_NOT_FORMATTED 0xC8A04554u
+static void save_marker(char *out, u32 cap) { snprintf(out, cap, "%s/.formatted", P->save_dir); }
+
+static void done_save_mount(Thread *t) {
+  u32 *cmd = cmd_of(t);
+  if (P->fs.result) {
+    log_printf("fs: save data not formatted yet (first boot)\n");
+    cmd[0] = ipc_header(0x80C, 1, 0);
+    cmd[1] = RES_FS_NOT_FORMATTED;
+    return;
+  }
+  archives_open++;
+  cmd[0] = ipc_header(0x80C, 3, 0);
+  cmd[2] = ARCH_SAVEDATA;
+  cmd[3] = archives_open;
+  cmd[1] = 0;
+}
+
+static void done_format(Thread *t) {
+  u32 *cmd = cmd_of(t);
+  log_printf("fs: save data formatted\n");
+  cmd[0] = ipc_header(pend.id, 1, 0);
+  cmd[1] = 0;
+}
+
+static void sysdata_peek(Thread *t, u64 offset, void (*then)(Thread *t)) {
+  JobFs *f = &P->fs;
+  f->file = pend.slot;
+  f->offset = offset;
+  f->size = 0x200;
+  f->buf = sup_pa(bounce_buf);
+  issue(t, FSOP_READ, then);
+}
+
+static u32 ivfc_level3(void) {
+  if (P->fs.result || P->fs.value < 0x60 || memcmp(bounce_buf, "IVFC", 4)) return 0;
+  u32 master, log2;
+  memcpy(&master, bounce_buf + 0x08, 4);
+  memcpy(&log2, bounce_buf + 0x4C, 4);
+  u32 block = log2 >= 4 && log2 <= 20 ? 1u << log2 : 0x1000u;
+  return (0x60u + master + block - 1) & ~(block - 1);
+}
+
+static void sysdata_done(Thread *t) {
+  P->fs.result = 0;
+  P->fs.value = pend.slot;
+  finish_open(t);
+}
+
+static void done_sysdata_romfs(Thread *t) {
+  u32 l3 = ivfc_level3();
+  if (!l3) log_printf("fs: %s has no readable RomFS\n", P->fs.path);
+  pend.base += l3;
+  sysdata_done(t);
+}
+
+static void done_sysdata_peek(Thread *t) {
+  u32 l3 = ivfc_level3();
+  pend.base = l3;
+  if (!l3 && !P->fs.result && P->fs.value >= 0x200 && !memcmp(bounce_buf + 0x100, "NCCH", 4)) {
+    u32 off;
+    memcpy(&off, bounce_buf + 0x1B0, 4);
+    u32 units = 0x200u << bounce_buf[0x18E];
+    if (!(bounce_buf[0x18F] & 4u)) {
+      log_printf("fs: %s is still encrypted (decrypt it with GodMode9 first)\n", P->fs.path);
+    } else if (off) {
+      pend.base = off * units;
+      sysdata_peek(t, pend.base, done_sysdata_romfs);
+      return;
+    }
+  }
+  sysdata_done(t);
+}
+
 static void done_open(Thread *t) {
   u32 *cmd = cmd_of(t);
   u32 id = pend.id;
+  if (pend.sysdata == 1 && P->fs.path2[0]) {
+    P->fs.path2[sizeof P->fs.path2 - 1] = 0;
+    log_printf("fs: NAND copy of %s: %s\n", P->fs.path + 16, P->fs.path2);
+  }
+  if (P->fs.result && pend.sysdata == 1) {
+    size_t n = strlen(P->fs.path);
+    memcpy(P->fs.path + n - 6, ".app", 5);
+    pend.sysdata = 2;
+    P->fs.flags = 1u;
+    issue(t, FSOP_OPEN, done_open);
+    return;
+  }
+  if (P->fs.result && !pend.sysdata && retail_title()) {
+    static u32 logged;
+    if (logged < 8) {
+      logged++;
+      log_printf("fs: can't open %s (%08X)\n", P->fs.path, (u32)P->fs.result);
+    }
+  }
   if (P->fs.result) {
+    if (pend.sysdata) {
+      size_t n = strlen(P->fs.path);
+      P->fs.path[n - 4] = 0;
+      log_printf("fs: no %s.romfs or .app (dump that title there)\n", P->fs.path);
+    }
     cmd[0] = ipc_header(id, 1, 0);
     cmd[1] = (u32)P->fs.result;
     return;
   }
+  if (pend.sysdata) {
+    pend.sysdata = 0;
+    pend.slot = P->fs.value;
+    sysdata_peek(t, 0, done_sysdata_peek);
+    return;
+  }
+  finish_open(t);
+}
+
+static void finish_open(Thread *t) {
+  u32 *cmd = cmd_of(t);
+  u32 id = pend.id;
   Object *se = NULL;
   u32 h = session_new(id == 0x80B ? &fs_dir_service : &fs_file_service, &se);
   if (!h) {
@@ -130,6 +292,16 @@ static void done_open(Thread *t) {
   }
   se->u.se.data[SLOT] = P->fs.value;
   se->u.se.data[FLAGS] = P->fs.flags;
+  se->u.se.data[SELF] = !pend.base && self_path(P->fs.path);
+  se->u.se.data[BASE] = pend.base;
+  if (tracing()) {
+    u32 s = P->fs.value & 31u;
+    trace_close(s);
+    snprintf(fstat[s].path, sizeof fstat[s].path, "%s", P->fs.path);
+    fstat[s].reads = fstat[s].writes = 0;
+    fstat[s].rbytes = fstat[s].wbytes = 0;
+    trace_printf("fs: opened %s (%s)\n", P->fs.path, (P->fs.flags & 2u) ? "read/write" : "read");
+  }
   cmd[0] = ipc_header(id, 1, 2);
   cmd[1] = 0;
   cmd[2] = 0x10u;
@@ -161,6 +333,8 @@ static void fs_request(Thread *t, Object *session, u32 *cmd) {
   JobFs *f = &P->fs;
   pend.id = id;
   pend.session = NULL;
+  pend.base = 0;
+  pend.sysdata = 0;
   switch (id) {
   case 0x801:
   case 0x861:
@@ -170,13 +344,37 @@ static void fs_request(Thread *t, Object *session, u32 *cmd) {
     cmd[0] = ipc_header(id, 1, 0);
     cmd[1] = 0;
     return;
+  case 0x84C:
+    save_marker(f->path, sizeof f->path);
+    f->value64 = 0;
+    issue(t, FSOP_CREATE, done_format);
+    return;
   case 0x863:
     cmd[0] = ipc_header(id, 2, 0);
     cmd[1] = 0;
     cmd[2] = 0;
     return;
   case 0x80C:
-    if (cmd[1] != 9u && cmd[1] != 0xAu) {
+    trace_printf("fs: mount archive 0x%X\n", cmd[1]);
+    if (cmd[1] == ARCH_NCCH) {
+      u32 lo = binary_word(cmd[2], cmd[3], cmd[5], 0), hi = binary_word(cmd[2], cmd[3], cmd[5], 1);
+      log_printf("fs: title %08X%08X's content (archive 0x2345678A, media %u)\n", hi, lo,
+                 binary_word(cmd[2], cmd[3], cmd[5], 2));
+      archives_open++;
+      ncch_titles[archives_open & 7u].lo = lo;
+      ncch_titles[archives_open & 7u].hi = hi;
+      cmd[0] = ipc_header(id, 3, 0);
+      cmd[2] = ARCH_NCCH;
+      cmd[3] = archives_open;
+      cmd[1] = 0;
+      return;
+    }
+    if (cmd[1] == ARCH_SAVEDATA && retail_title()) {
+      save_marker(f->path, sizeof f->path);
+      issue(t, FSOP_STAT, done_save_mount);
+      return;
+    }
+    if (!sd_archive(cmd[1], 0) && !(cmd[1] == ARCH_SELFNCCH && P->self_romfs)) {
       log_printf("fs: archive 0x%X is not here\n", cmd[1]);
       cmd[0] = ipc_header(id, 1, 0);
       cmd[1] = RES_FS_NOT_FOUND;
@@ -210,6 +408,28 @@ static void fs_request(Thread *t, Object *session, u32 *cmd) {
     u32 ptype = direct ? cmd[5] : cmd[4], psize = direct ? cmd[6] : cmd[5];
     u32 flags = direct ? cmd[7] : cmd[6];
     u32 pva = direct ? cmd[12] : cmd[9];
+    if (arch == ARCH_NCCH) {
+      u32 lo, hi;
+      if (direct) {
+        lo = binary_word(cmd[3], cmd[4], cmd[10], 0), hi = binary_word(cmd[3], cmd[4], cmd[10], 1);
+        log_printf("fs: title %08X%08X's content (archive 0x2345678A)\n", hi, lo);
+      } else {
+        lo = ncch_titles[cmd[3] & 7u].lo, hi = ncch_titles[cmd[3] & 7u].hi;
+      }
+      snprintf(f->path, sizeof f->path, "/Aurora/sysdata/%08X%08X.romfs", hi, lo);
+      f->flags = 1u;
+      f->path2[0] = 0;
+      pend.sysdata = 1;
+      issue(t, FSOP_OPEN, done_open);
+      return;
+    }
+    if (arch == ARCH_SELFNCCH && P->self_romfs) {
+      snprintf(f->path, sizeof f->path, "%s", P->path + 5);
+      f->flags = 1u;
+      pend.base = P->self_romfs;
+      issue(t, FSOP_OPEN, done_open);
+      return;
+    }
     if (!sd_archive(arch, arch_hi)) {
       if (direct)
         log_printf("fs: archive 0x%X is not here\n", arch);
@@ -217,7 +437,7 @@ static void fs_request(Thread *t, Object *session, u32 *cmd) {
       cmd[1] = RES_FS_NOT_FOUND;
       return;
     }
-    if (!get_path(ptype, psize, pva, f->path, sizeof f->path)) {
+    if (!apath(arch, arch_hi, ptype, psize, pva, f->path, sizeof f->path)) {
       cmd[0] = ipc_header(id, 1, 0);
       cmd[1] = 0xE0E046BEu;
       return;
@@ -225,6 +445,10 @@ static void fs_request(Thread *t, Object *session, u32 *cmd) {
     f->flags = flags;
     if (flags & 2u)
       ra_drop();
+    if (retail_title()) {
+      static u32 shown;
+      if (shown++ < 12) log_printf("fs: open %s%s\n", f->path, (flags & 2u) ? " (write)" : "");
+    }
     issue(t, FSOP_OPEN, done_open);
     return;
   }
@@ -233,7 +457,7 @@ static void fs_request(Thread *t, Object *session, u32 *cmd) {
   case 0x807:
   case 0x809: {
     u32 pva = id == 0x809 ? cmd[8] : cmd[7];
-    if (!sd_archive(cmd[2], cmd[3]) || !get_path(cmd[4], cmd[5], pva, f->path, sizeof f->path)) {
+    if (!apath(cmd[2], cmd[3], cmd[4], cmd[5], pva, f->path, sizeof f->path)) {
       cmd[0] = ipc_header(id, 1, 0);
       cmd[1] = RES_FS_NOT_FOUND;
       return;
@@ -244,7 +468,7 @@ static void fs_request(Thread *t, Object *session, u32 *cmd) {
     return;
   }
   case 0x808:
-    if (!sd_archive(cmd[2], cmd[3]) || !get_path(cmd[4], cmd[5], cmd[10], f->path, sizeof f->path)) {
+    if (!apath(cmd[2], cmd[3], cmd[4], cmd[5], cmd[10], f->path, sizeof f->path)) {
       cmd[0] = ipc_header(id, 1, 0);
       cmd[1] = RES_FS_NOT_FOUND;
       return;
@@ -255,9 +479,8 @@ static void fs_request(Thread *t, Object *session, u32 *cmd) {
     return;
   case 0x805:
   case 0x80A: {
-    if (!sd_archive(cmd[2], cmd[3]) || !sd_archive(cmd[6], cmd[7]) ||
-        !get_path(cmd[4], cmd[5], cmd[11], f->path, sizeof f->path) ||
-        !get_path(cmd[8], cmd[9], cmd[13], f->path2, sizeof f->path2)) {
+    if (!apath(cmd[2], cmd[3], cmd[4], cmd[5], cmd[11], f->path, sizeof f->path) ||
+        !apath(cmd[6], cmd[7], cmd[8], cmd[9], cmd[13], f->path2, sizeof f->path2)) {
       cmd[0] = ipc_header(id, 1, 0);
       cmd[1] = RES_FS_NOT_FOUND;
       return;
@@ -267,7 +490,7 @@ static void fs_request(Thread *t, Object *session, u32 *cmd) {
     return;
   }
   case 0x80B:
-    if (!sd_archive(cmd[1], cmd[2]) || !get_path(cmd[3], cmd[4], cmd[6], f->path, sizeof f->path)) {
+    if (!apath(cmd[1], cmd[2], cmd[3], cmd[4], cmd[6], f->path, sizeof f->path)) {
       cmd[0] = ipc_header(id, 1, 0);
       cmd[1] = RES_FS_NOT_FOUND;
       return;
@@ -284,9 +507,35 @@ static void fs_request(Thread *t, Object *session, u32 *cmd) {
   }
 }
 
+static bool self_path(const char *path) {
+  const char *own = P->path;
+  if (!P->self_romfs || memcmp(own, "sdmc:", 5)) return false;
+  own += 5;
+  for (; *own && *path; own++, path++) {
+    char a = *own, b = *path;
+    if (a >= 'A' && a <= 'Z') a = (char)(a - 'A' + 'a');
+    if (b >= 'A' && b <= 'Z') b = (char)(b - 'A' + 'a');
+    if (a != b) return false;
+  }
+  return !*own && !*path;
+}
+
+static void self_header(u64 offset, u8 *buf, u32 n) {
+  u8 h[0x2C];
+  memset(h, 0, sizeof h);
+  memcpy(h, "3DSX", 4);
+  h[4] = 0x2C;
+  h[6] = 8;
+  u32 fs = P->self_romfs;
+  h[0x28] = (u8)fs; h[0x29] = (u8)(fs >> 8); h[0x2A] = (u8)(fs >> 16); h[0x2B] = (u8)(fs >> 24);
+  for (u32 i = 0; i < n && offset + i < sizeof h; i++) buf[i] = h[offset + i];
+}
+
 static void reply_rw(Thread *t, s32 res) {
   u32 *cmd = cmd_of(t);
   bool write = pend.id == 0x803;
+  if (!write && !res && pend.done && pend.offset < 0x2C && pend.session && pend.session->u.se.data[SELF])
+    self_header(pend.offset, (u8 *)(uintptr_t)pend.va, pend.done);
   cmd[0] = ipc_header(pend.id, 2, 2);
   cmd[1] = (u32)res;
   cmd[2] = pend.done;
@@ -351,11 +600,16 @@ static void rw_next(Thread *t) {
 
 static void done_size(Thread *t) {
   u32 *cmd = cmd_of(t);
+  u64 size = P->fs.value64;
+  u32 base = pend.session ? pend.session->u.se.data[BASE] : 0;
+  size = size > base ? size - base : 0;
   cmd[0] = ipc_header(0x804, 3, 0);
   cmd[1] = (u32)P->fs.result;
-  cmd[2] = (u32)P->fs.value64;
-  cmd[3] = (u32)(P->fs.value64 >> 32);
+  cmd[2] = (u32)size;
+  cmd[3] = (u32)(size >> 32);
 }
+
+static u8 links[32];
 
 static void file_request(Thread *t, Object *se, u32 *cmd) {
   u32 id = cmd[0] >> 16;
@@ -365,8 +619,15 @@ static void file_request(Thread *t, Object *se, u32 *cmd) {
   pend.session = se;
   switch (id) {
   case 0x802: {
-    pend.offset = cmd[1] | (u64)cmd[2] << 32;
+    pend.offset = (cmd[1] | (u64)cmd[2] << 32) + se->u.se.data[BASE];
     pend.size = cmd[3];
+    if (tracing() && slot) {
+      u32 s = slot & 31u;
+      if (fstat[s].reads < 4)
+        trace_printf("fs: read %s @%llX +%X\n", fstat[s].path, cmd[1] | (u64)cmd[2] << 32, cmd[3]);
+      fstat[s].reads++;
+      fstat[s].rbytes += cmd[3];
+    }
     pend.va = cmd[5];
     pend.done = 0;
     if (!pend.size) {
@@ -401,6 +662,13 @@ static void file_request(Thread *t, Object *se, u32 *cmd) {
   case 0x803:
     pend.offset = cmd[1] | (u64)cmd[2] << 32;
     pend.size = cmd[3];
+    if (tracing() && slot) {
+      u32 s = slot & 31u;
+      if (fstat[s].writes < 16)
+        trace_printf("fs: write %s @%llX +%X\n", fstat[s].path, pend.offset, cmd[3]);
+      fstat[s].writes++;
+      fstat[s].wbytes += cmd[3];
+    }
     pend.va = cmd[6];
     pend.done = 0;
     ra_drop();
@@ -421,11 +689,29 @@ static void file_request(Thread *t, Object *se, u32 *cmd) {
     f->value64 = cmd[1] | (u64)cmd[2] << 32;
     issue(t, FSOP_SETSIZE, done_simple);
     return;
+  case 0x80C: {
+    Object *copy = NULL;
+    u32 h = slot ? session_new(&fs_file_service, &copy) : 0;
+    if (h) {
+      for (int i = 0; i < 6; i++) copy->u.se.data[i] = se->u.se.data[i];
+      links[slot & 31u]++;
+    }
+    cmd[0] = ipc_header(id, 1, 2);
+    cmd[1] = h ? 0 : (slot ? RES_OUT_OF_HANDLES : RES_INVALID_HANDLE);
+    cmd[2] = 0x10u;
+    cmd[3] = h;
+    return;
+  }
   case 0x808:
     if (ra.slot == slot)
       ra_drop();
     f->file = slot;
     se->u.se.data[SLOT] = 0;
+    if (slot && links[slot & 31u]) {
+      links[slot & 31u]--;
+      slot = 0;
+    }
+    if (slot) trace_close(slot);
     if (!slot) {
       cmd[0] = ipc_header(id, 1, 0);
       cmd[1] = 0;
@@ -456,7 +742,12 @@ static void file_request(Thread *t, Object *se, u32 *cmd) {
 
 static void file_closed(Object *se) {
   u32 slot = se->u.se.data[SLOT];
+  if (slot && links[slot & 31u]) {
+    links[slot & 31u]--;
+    return;
+  }
   if (slot) {
+    trace_close(slot);
     if (ra.slot == slot)
       ra_drop();
     P->close_files |= 1u << (slot & 31u);
@@ -582,4 +873,6 @@ void fs_reset(void) {
   memset(&pend, 0, sizeof pend);
   ra_drop();
   archives_open = 0;
+  memset(links, 0, sizeof links);
+  memset(fstat, 0, sizeof fstat);
 }

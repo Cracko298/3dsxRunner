@@ -3,24 +3,16 @@
 
 #include <stdint.h>
 
-/* How the ARM9 app and the ARM11 supervisor talk. The ARM9 posts one command
- * through Aurora's RUN11 mailbox, the supervisor does it and returns. JOB_RUN
- * runs the game until it has nothing to do, needs a file, exits or crashes,
- * and `yield` says which. Both CPUs share this page with no cache coherency,
- * so both sides clean their caches around every exchange. */
 #define JOB_PARAMS 0x25100000u
 #define JOB_CODE   0x25101000u
 #define SUP_END    0x25300000u
 
 #define JOB_MAGIC   0x58335355u
-#define JOB_VERSION 9u
+#define JOB_VERSION 16u
 
 #define DISPLAY_SLOT_SIZE 0x80000u
 #define DISPLAY_POOL_SIZE (3u * DISPLAY_SLOT_SIZE)
 
-/* The cancel word gets its own cache line. If it shared one with JobParams,
- * invalidating it on the ARM11 could throw away job results nobody wrote back
- * yet. */
 #define JOB_CANCEL_ADDR (JOB_CODE - 32u)
 enum { JOB_CANCEL_NONE, JOB_CANCEL_HOME, JOB_CANCEL_TIMEOUT };
 
@@ -77,7 +69,24 @@ enum {
   YIELD_CRASH,
   YIELD_ERROR,
   YIELD_HTTP,
+  YIELD_APPLET,
 };
+
+enum { APPLET_KEYBOARD = 1, APPLET_ERROR = 2 };
+#define APPLET_TEXT 1024u
+typedef struct {
+  uint32_t kind;
+  uint32_t max_len;
+  uint32_t buttons;
+  uint32_t password;
+  uint32_t numpad;
+  uint32_t valid;
+  uint32_t error_code;
+  int32_t pressed;
+  char hint[264];
+  char button[3][52];
+  char text[APPLET_TEXT];
+} JobApplet;
 
 typedef struct {
   uint32_t pa, size;
@@ -132,6 +141,10 @@ typedef struct {
   uint32_t far, fsr;
   uint32_t thread;
   uint32_t in_sup;
+  uint32_t entry;
+  uint32_t code[12];
+  uint32_t stack[20];
+  struct { uint32_t header, thread; char svc[8]; } recent[8];
 } JobCrash;
 
 #define HTTP_SLOTS 4u
@@ -188,10 +201,15 @@ typedef struct {
   uint32_t plugin_enabled, cheat_pa, cheat_bytes, cheats_on, cheat_failed, cheat_runs;
   JobMem mem;
 
-  /* ARM9 clock stamps: when this command was posted, and when the previous
-   * one was seen to finish (0 if it didn't finish cleanly). gpu.c uses them
-   * to skip waiting on the LCD when it can prove that's safe. */
   uint64_t wall_us, prev_done_us;
+  uint32_t applet_pa;
+  uint32_t self_romfs;
+  uint32_t retail_stack, retail_kernel, title_lo, title_hi;
+  char save_dir[96];
+  uint32_t retail_appmem;
+  uint32_t trace_pa, trace_size, trace_head;
+  int16_t cstick_x, cstick_y;
+  uint32_t zlzr;
 } JobParams;
 
 _Static_assert(sizeof(JobParams) <= JOB_CANCEL_ADDR - JOB_PARAMS, "JobParams must not overlap cancellation");

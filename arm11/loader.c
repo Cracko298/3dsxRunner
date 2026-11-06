@@ -8,7 +8,11 @@ typedef struct {
 } Hdr3dsx;
 
 #define STACK_SIZE 0x10000u
-#define VA_STACK_BASE (VA_STACK_TOP - STACK_SIZE)
+#define STACK_MAX  0x000F0000u
+
+#define OLD_LINEAR_DELTA 0x0C000000u
+static bool retail(void) { return (P->launch_flags & 4u) != 0; }
+static bool old_linear(void) { return retail() && P->retail_kernel && P->retail_kernel < 0x22Cu; }
 
 static bool fail(const char *why) {
   snprintf(P->error, sizeof P->error, "%s", why);
@@ -60,6 +64,10 @@ static void *map_page(u32 va, u32 flags) {
   return p;
 }
 
+u32 app_memory(void) {
+  return P->retail_appmem ? (P->retail_appmem & ~0xFu) : heap_size + linear_size;
+}
+
 static void config_pages(void) {
   u8 *cfg = map_page(VA_CONFIG, MAP_USER | MAP_RO);
   u8 *shr = map_page(VA_SHARED, MAP_USER);
@@ -72,8 +80,8 @@ static void config_pages(void) {
   c[0x10 / 4] = 2;
   cfg[0x14] = 1;
   c[0x18 / 4] = 0x0000F297u;
-  c[0x30 / 4] = P->new3ds ? 6u : 0u;
-  c[0x40 / 4] = heap_size + linear_size;
+  c[0x30 / 4] = P->retail_appmem ? (P->retail_appmem & 0xFu) : (P->new3ds ? 6u : 0u);
+  c[0x40 / 4] = app_memory();
   c[0x44 / 4] = 0x02C00000u;
   c[0x48 / 4] = 0x01400000u;
   c[0x60 / 4] = 0x023A0000u;
@@ -125,37 +133,49 @@ bool load_3dsx(void) {
   u32 seg_size[3] = {(h.code_size + 0xFFFu) & ~0xFFFu, (h.rodata_size + 0xFFFu) & ~0xFFFu,
                      (h.data_size + 0xFFFu) & ~0xFFFu};
   u64 required = (u64)seg_size[0] + seg_size[1] + seg_size[2] + 0x1000u;
-  if (required + STACK_SIZE + 0x200000u > P->code.size)
+  u32 stack = STACK_SIZE;
+  if (retail() && P->retail_stack > stack)
+    stack = P->retail_stack > STACK_MAX ? STACK_MAX : (P->retail_stack + 0xFFFu) & ~0xFFFu;
+  if (required + stack + 0x200000u > P->code.size)
     return fail("The program does not fit in the memory there is.");
 
   u32 image = (u32)required;
 
   heap_pa = P->code.pa;
-  heap_avail = (P->code.size - image - STACK_SIZE) & ~0xFFFu;
-  u32 image_pa = P->code.pa + P->code.size - image - STACK_SIZE;
+  heap_avail = (P->code.size - image - stack) & ~0xFFFu;
+  u32 image_pa = P->code.pa + P->code.size - image - stack;
   linear_pa = P->linear.pa;
   linear_avail = P->linear.size;
-  linear_va = linear_pa + LINEAR_DELTA;
+  if (P->launch_flags & 0x10u) {
+    linear_pa = heap_pa;
+    linear_avail = heap_avail;
+  }
+  if (old_linear()) {
+    if (linear_pa + linear_avail > 0x28000000u)
+      return fail("This title expects its GPU memory below 0x28000000, which this layout can't give it.");
+    linear_va = linear_pa - OLD_LINEAR_DELTA;
+  } else {
+    linear_va = linear_pa + LINEAR_DELTA;
+  }
   font_pa = font_va = 0;
   if (P->font_head_pa && P->font_glyphs_pa && P->font_atlas_pa && linear_avail > 4 * FONT_RESERVE) {
     linear_avail -= FONT_RESERVE;
-    /* The system font sits at the very end of the linear heap so the GPU can
-     * read it like any other texture. */
     font_pa = linear_pa + linear_avail;
-    font_va = font_pa + LINEAR_DELTA;
+    font_va = font_pa + (linear_va - linear_pa);
   }
+  linear_low = linear_avail;
+  image_bytes = image + stack;
   u32 total = choose_total(heap_avail, linear_avail);
   if (!total)
     return fail("There is not enough memory for the program's heaps.");
   ctru_split(total, &heap_size, &linear_size);
 
   if (!mmu_map(VA_CODE, image_pa, image, MAP_USER) ||
-      !mmu_map(VA_STACK_BASE, image_pa + image, STACK_SIZE, MAP_USER))
+      !mmu_map(VA_STACK_TOP - stack, image_pa + image, stack, MAP_USER))
     return fail("The guest's memory could not be mapped.");
   u32 *stub = map_page(VA_STACK, MAP_USER | MAP_RO);
   if (!stub)
     return fail("Out of supervisor pages.");
-  /* main() returns here: an svc ExitProcess (and ExitThread for threads). */
   stub[0] = 0xEF000003u;
   stub[1] = 0xEAFFFFFEu;
   stub[2] = 0xEF000009u;
@@ -163,7 +183,6 @@ bool load_3dsx(void) {
   for (u32 off = 0; off < MAX_THREADS * TLS_SIZE; off += 0x1000u)
     if (!map_page(VA_TLS + off, MAP_USER))
       return fail("Out of supervisor pages.");
-  /* VRAM is uncached for the game so its CPU writes actually reach the GPU. */
   if (!mmu_map(VA_VRAM, PA_VRAM, VRAM_SIZE, MAP_USER | MAP_UNCACHED))
     return fail("VRAM could not be mapped.");
 
@@ -171,6 +190,43 @@ bool load_3dsx(void) {
   for(unsigned i=0;i<3;i++) { image_seg_va[i]=seg_va[i]; image_seg_size[i]=seg_size[i]; }
   u8 *seg[3] = {(u8 *)(uintptr_t)seg_va[0], (u8 *)(uintptr_t)seg_va[1], (u8 *)(uintptr_t)seg_va[2]};
   memset(seg[0], 0, image);
+  if (h.flags & 0x80000000u) {
+    u32 off = h.header_size + 3u * h.reloc_hdr_size, in_len = file_size - off;
+    if (off >= file_size || in_len < 8 || in_len > image)
+      return fail("The packed code is cut short.");
+    u8 *buf = seg[0];
+    memcpy(buf, file + off, in_len);
+    u32 top, extra;
+    memcpy(&top, buf + in_len - 8, 4);
+    memcpy(&extra, buf + in_len - 4, 4);
+    u32 out_len = in_len + extra, index = in_len - (top >> 24), stop = in_len - (top & 0xFFFFFFu), o = out_len;
+    if ((top >> 24) < 8 || (top & 0xFFFFFFu) > in_len || out_len > image || out_len < in_len)
+      return fail("The packed code is damaged.");
+    while (index > stop) {
+      u8 control = buf[--index];
+      for (int i = 0; i < 8 && index > stop; i++, control <<= 1) {
+        if (control & 0x80) {
+          if (index < stop + 2) return fail("The packed code is damaged.");
+          index -= 2;
+          u32 sg = buf[index] | buf[index + 1] << 8;
+          u32 len = ((sg >> 12) & 15u) + 3u, disp = (sg & 0xFFFu) + 2u;
+          if (o < len) return fail("The packed code is damaged.");
+          for (u32 j = 0; j < len; j++) {
+            if (o + disp >= out_len) return fail("The packed code is damaged.");
+            buf[o - 1] = buf[o + disp];
+            o--;
+          }
+        } else {
+          if (!o) return fail("The packed code is damaged.");
+          buf[--o] = buf[--index];
+        }
+      }
+    }
+    u32 init = h.code_size + h.rodata_size + (h.data_size - h.bss_size);
+    if (init < image) memset(buf + init, 0, image - init);
+    log_printf("code unpacked on the ARM11: %uK -> %uK\n", in_len >> 10, out_len >> 10);
+    goto relocated;
+  }
   u32 tables = h.reloc_hdr_size / 4;
   u32 rel[3][16];
   u32 off = h.header_size;
@@ -230,6 +286,7 @@ bool load_3dsx(void) {
     }
   }
 
+relocated:;
   u8 *args = seg[2] + seg_size[2];
   u32 args_va = seg_va[2] + seg_size[2];
   *(u32 *)(void *)args = P->path[0] && !(P->launch_flags & 1u) ? 1u : 0u;
@@ -263,5 +320,8 @@ bool load_3dsx(void) {
   t->ctx.lr = VA_STACK;
   log_printf("loaded: code %uK rodata %uK data %uK; heap %uK, linear %uK\n", h.code_size >> 10,
              h.rodata_size >> 10, h.data_size >> 10, heap_size >> 10, linear_size >> 10);
+  if (retail())
+    log_printf("retail title %08X%08X: kernel %u.%u, stack %uK, linear at %08X\n", P->title_hi, P->title_lo,
+               P->retail_kernel >> 8, P->retail_kernel & 0xFFu, stack >> 10, linear_va);
   return true;
 }

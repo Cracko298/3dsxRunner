@@ -2,10 +2,6 @@
 
 #include "sup.h"
 
-/* A tiny stand-in for the bits of Horizon's kernel that libctru actually uses.
- * Scheduling copies Horizon's app core: highest priority ready thread runs
- * until it waits, sleeps, or wakes someone more important. No time slicing.
- * When everyone is waiting, the job ends and the ARM9 shows the frame. */
 Thread threads[MAX_THREADS];
 Thread *cur;
 static u32 next_tid, order_counter;
@@ -132,7 +128,6 @@ static void clock_stop(void) {
   preempt_stop();
 }
 
-/* The private timer runs at half the CPU clock, whatever the CPU clock is. */
 u64 ticks(void) {
   u32 now = MPC(PTIMER_COUNT), delta = ptimer_last - now;
   ptimer_last = now;
@@ -148,6 +143,20 @@ u64 ns_to_ticks(s64 ns) {
   return (n / 1000000u) * (SYSCLOCK / 1000u) + (n % 1000000u) * SYSCLOCK / 1000000000u;
 }
 
+#define TRACE_SIZE 0x18000u
+static char trace_buf[TRACE_SIZE];
+
+bool tracing(void) { return (P->launch_flags & 8u) != 0; }
+
+static void trace_put(const char *buf, int n) {
+  if (!tracing()) return;
+  P->trace_pa = (u32)(uintptr_t)trace_buf;
+  P->trace_size = TRACE_SIZE;
+  for (int i = 0; i < n; i++)
+    trace_buf[(P->trace_head + (u32)i) % TRACE_SIZE] = buf[i];
+  P->trace_head += (u32)n;
+}
+
 void log_printf(const char *fmt, ...) {
   char buf[192];
   va_list ap;
@@ -159,6 +168,19 @@ void log_printf(const char *fmt, ...) {
   for (int i = 0; i < n; i++)
     P->log[(P->log_head + (u32)i) % JOB_LOG_SIZE] = buf[i];
   P->log_head += (u32)n;
+  trace_put(buf, n);
+}
+
+void trace_printf(const char *fmt, ...) {
+  if (!tracing()) return;
+  char buf[192];
+  va_list ap;
+  va_start(ap, fmt);
+  int n = vsnprintf(buf, sizeof buf, fmt, ap);
+  va_end(ap);
+  if (n > (int)sizeof buf - 1)
+    n = sizeof buf - 1;
+  trace_put(buf, n);
 }
 
 void sup_fail(const char *why) {
@@ -168,9 +190,6 @@ void sup_fail(const char *why) {
   sup_yield();
 }
 
-/* The ARM9 writes the cancel word, and the caches here are not coherent with
- * the ARM9 at all. A plain volatile read can keep returning the old value
- * forever on real hardware, so we invalidate that one line first. */
 void job_check_cancel(void) {
 
   u32 address = JOB_CANCEL_ADDR;
@@ -268,6 +287,7 @@ Thread *thread_new(u32 entry, u32 arg, u32 sp, s32 prio, s32 core) {
     t->prio = prio;
     t->core = core;
     t->id = ++next_tid;
+    t->entry = entry;
     t->order = ++order_counter;
     t->state = TS_READY;
     t->deadline = NO_DEADLINE;
@@ -461,7 +481,7 @@ Ctx *schedule(void) {
     gpu_lcd_sample();
   if (gsp_gx_inflight)
     gsp_gx_poll();
-  if (P->yield == YIELD_FS || P->yield == YIELD_HTTP) {
+  if (P->yield == YIELD_FS || P->yield == YIELD_HTTP || P->yield == YIELD_APPLET) {
     publish();
     clock_stop();
     sup_yield();
@@ -473,8 +493,6 @@ Ctx *schedule(void) {
     return &t->ctx;
   }
 
-  /* Nobody can run, but the GPU is still busy. Whatever they're waiting on
-   * is probably that GPU interrupt, so wait for it right here. */
   if (gsp_gx_inflight) {
     gsp_gx_wait();
     continue;
@@ -514,6 +532,9 @@ u32 heap_size, linear_size, linear_va;
 u32 heap_pa, heap_avail, linear_pa, linear_avail;
 u32 font_pa, font_va;
 static u32 heap_mapped, linear_mapped;
+u32 linear_low;
+u32 image_bytes;
+static bool pool(void) { return (P->launch_flags & 0x10u) != 0; }
 u32 heap_in_use(void) { return heap_mapped; }
 u32 linear_in_use(void) { return linear_mapped; }
 
@@ -523,19 +544,41 @@ static s32 control_memory(u32 op, u32 a0, u32 a1, u32 size, u32 *out) {
   (void)a1;
   if (kind == 3) {
     if (linear) {
-      if (size > linear_avail - linear_mapped)
+      u32 sz = (size + 0xFFFu) & ~0xFFFu, off;
+      if (pool()) {
+        if (sz > linear_low || linear_low - sz < heap_mapped) {
+          log_printf("ControlMemory: no room for %uK of GPU memory (heap %uK, GPU %uK)\n", sz >> 10,
+                     heap_mapped >> 10, linear_mapped >> 10);
+          return (s32)RES_OUT_OF_MEMORY;
+        }
+        off = linear_low - sz;
+      } else {
+        if (size > linear_avail - linear_mapped) {
+          log_printf("ControlMemory: no room for %uK of GPU memory (%uK free)\n", sz >> 10,
+                     (linear_avail - linear_mapped) >> 10);
+          return (s32)RES_OUT_OF_MEMORY;
+        }
+        off = linear_mapped;
+      }
+      u32 va = linear_va + off;
+      if (!mmu_map(va, linear_pa + off, sz, MAP_USER))
         return (s32)RES_OUT_OF_MEMORY;
-      u32 va = linear_va + linear_mapped;
-      if (!mmu_map(va, linear_pa + linear_mapped, (size + 0xFFFu) & ~0xFFFu, MAP_USER))
-        return (s32)RES_OUT_OF_MEMORY;
+      if (pool()) linear_low = off;
+      memset((void *)(uintptr_t)va, 0, (size + 0xFFFu) & ~0xFFFu);
+      cache_clean_all();
       linear_mapped += (size + 0xFFFu) & ~0xFFFu;
       *out = va;
       return 0;
     }
-    if (a0 < VA_HEAP || a0 + size > VA_HEAP + heap_avail || a0 != VA_HEAP + heap_mapped)
+    if (a0 < VA_HEAP || a0 + size > VA_HEAP + heap_avail || a0 != VA_HEAP + heap_mapped ||
+        (pool() && heap_mapped + ((size + 0xFFFu) & ~0xFFFu) > linear_low)) {
+      log_printf("ControlMemory: no room for %uK of heap at %08X (heap %uK of %uK, GPU %uK)\n", size >> 10, a0,
+                 heap_mapped >> 10, heap_avail >> 10, linear_mapped >> 10);
       return (s32)RES_OUT_OF_MEMORY;
+    }
     if (!mmu_map(a0, heap_pa + heap_mapped, (size + 0xFFFu) & ~0xFFFu, MAP_USER))
       return (s32)RES_OUT_OF_MEMORY;
+    memset((void *)(uintptr_t)a0, 0, (size + 0xFFFu) & ~0xFFFu);
     heap_mapped += (size + 0xFFFu) & ~0xFFFu;
     *out = a0;
     return 0;
@@ -544,8 +587,12 @@ static s32 control_memory(u32 op, u32 a0, u32 a1, u32 size, u32 *out) {
     mmu_unmap(a0, (size + 0xFFFu) & ~0xFFFu);
     if (a0 >= VA_HEAP && a0 + size == VA_HEAP + heap_mapped)
       heap_mapped -= (size + 0xFFFu) & ~0xFFFu;
-    if (a0 >= linear_va && a0 + size == linear_va + linear_mapped)
+    if (!pool() && a0 >= linear_va && a0 + size == linear_va + linear_mapped)
       linear_mapped -= (size + 0xFFFu) & ~0xFFFu;
+    if (pool() && a0 == linear_va + linear_low) {
+      linear_low += (size + 0xFFFu) & ~0xFFFu;
+      linear_mapped -= (size + 0xFFFu) & ~0xFFFu;
+    }
     *out = a0;
     return 0;
   }
@@ -692,6 +739,19 @@ static void exit_thread(Thread *t) {
   obj_unref(t->obj);
 }
 
+void crash_extras(u32 pc, u32 sp) {
+  P->crash.entry = cur ? cur->entry : 0;
+  for (u32 i = 0; i < 12; i++) {
+    u32 va = (pc & ~3u) - 32u + i * 4u;
+    P->crash.code[i] = mmu_user_ok(va, 4) ? *(volatile u32 *)(uintptr_t)va : 0;
+  }
+  for (u32 i = 0; i < 20; i++) {
+    u32 va = (sp & ~3u) + i * 4u;
+    P->crash.stack[i] = mmu_user_ok(va, 4) ? *(volatile u32 *)(uintptr_t)va : 0;
+  }
+  ipc_recent(&P->crash);
+}
+
 __attribute__((noreturn)) static void svc_break(Ctx *c, u32 kind) {
   memcpy(P->crash.r, c->r, 13 * 4);
   P->crash.r[13] = c->sp, P->crash.r[14] = c->lr, P->crash.r[15] = c->pc;
@@ -700,12 +760,62 @@ __attribute__((noreturn)) static void svc_break(Ctx *c, u32 kind) {
   P->crash.far = c->r[0];
   P->crash.thread = cur ? cur->id : 0;
   P->crash.in_sup = 0;
+  crash_extras(c->pc, c->sp);
   P->yield = YIELD_CRASH;
   clock_stop();
   sup_yield();
 }
 
 static u32 unknown_svcs[8];
+
+static struct { u32 num, result, pc; } svc_ring[8];
+static u32 svc_ring_n;
+
+void wait_dump(void) {
+  static const char *const types[] = {"?", "event", "mutex", "semaphore", "timer", "arbiter", "thread",
+                                      "process", "port", "session", "memblock", "reslimit"};
+  static const char *const waits[] = {"", "sync", "arbiter", "sleep", "file", "vblank"};
+  bool any = false;
+  svc_ring_dump();
+  for (int i = 0; i < MAX_THREADS; i++) {
+    Thread *t = &threads[i];
+    if (t->state == TS_FREE) continue;
+    if (!any) log_printf("threads:\n");
+    any = true;
+    if (t->state != TS_WAIT) {
+      log_printf("  thread %u (entry %08X, prio %d) at %08X: %s\n", t->id, t->entry, (int)t->prio, t->ctx.pc,
+                 t->state == TS_READY ? "ready to run" : "exited");
+      u32 at = (t->ctx.pc & ~3u) - 16u;
+      if (t->state == TS_READY && mmu_user_ok(at, 32)) {
+        const u32 *w = (const u32 *)(uintptr_t)at;
+        log_printf("    code: %08X %08X %08X %08X >%08X %08X %08X %08X  lr %08X r0 %08X r1 %08X\n", w[0], w[1],
+                   w[2], w[3], w[4], w[5], w[6], w[7], t->ctx.lr, t->ctx.r[0], t->ctx.r[1]);
+      }
+      continue;
+    }
+    log_printf("  thread %u (entry %08X, prio %d) at %08X: %s%s", t->id, t->entry, (int)t->prio, t->ctx.pc,
+               t->wait < 6 ? waits[t->wait] : "?", t->deadline != NO_DEADLINE ? " (with timeout)" : "");
+    if (t->wait == WAIT_ARB) log_printf(" on %08X", t->waddr);
+    if (t->wait == WAIT_SYNC)
+      for (u32 k = 0; k < t->nw && k < 4; k++) {
+        Object *o = t->wobj[k];
+        if (!o) continue;
+        log_printf("%s %s", k ? "," : " on", o->type < 12 ? types[o->type] : "?");
+        if (o->who) log_printf(" [%s]", o->who);
+        if (o->type == OBJ_THREAD && o->u.th.t) log_printf(" %u", o->u.th.t->id);
+      }
+    log_printf("%s\n", t->nw > 4 ? " ..." : "");
+  }
+}
+
+void svc_ring_dump(void) {
+  log_printf("last kernel calls (oldest first):\n");
+  for (u32 i = 0; i < 8; i++) {
+    u32 k = (svc_ring_n + i) & 7u;
+    if (svc_ring[k].pc)
+      log_printf("  svc 0x%02X from %08X -> %08X\n", svc_ring[k].num, svc_ring[k].pc, svc_ring[k].result);
+  }
+}
 
 Ctx *trap_svc(Ctx *c) {
   u32 num;
@@ -734,6 +844,9 @@ Ctx *trap_svc(Ctx *c) {
     }
     Thread *t = thread_new(c->r[1], c->r[2], c->r[3] & ~7u, prio, (s32)c->r[4]);
     u32 h = t ? handle_new(t->obj) : 0;
+    if (t)
+      trace_printf("thread %u created by %u: entry %08X, arg %08X, stack %08X, prio %d, core %d\n", t->id,
+                   cur ? cur->id : 0, c->r[1], c->r[2], c->r[3], (int)prio, (int)(s32)c->r[4]);
     if (!h) {
       if (t)
         exit_thread(t);
@@ -745,6 +858,7 @@ Ctx *trap_svc(Ctx *c) {
     break;
   }
   case 0x09:
+    trace_printf("thread %u exited\n", cur ? cur->id : 0);
     exit_thread(cur);
     break;
   case 0x0A: {
@@ -940,7 +1054,7 @@ Ctx *trap_svc(Ctx *c) {
     u32 pa = mmu_pa(addr);
     Object *o = new_with_handle(OBJ_MEMBLOCK, c);
     if (o)
-      o->u.mb.pa = pa, o->u.mb.size = size;
+      o->u.mb.pa = pa, o->u.mb.size = size, o->u.mb.cva = addr;
     break;
   }
   case 0x1F: {
@@ -1027,7 +1141,7 @@ Ctx *trap_svc(Ctx *c) {
     u64 v = 0;
     c->r[0] = 0;
     if (c->r[1] == 0)
-      v = c->r[2] == 1 ? (u64)(heap_mapped + linear_mapped) : 0;
+      v = c->r[2] == 1 ? (u64)(heap_mapped + linear_mapped + image_bytes) : 0;
     else if (c->r[1] == 2)
       v = 5;
     else if (c->r[1] == 26)
@@ -1042,7 +1156,7 @@ Ctx *trap_svc(Ctx *c) {
     u64 v = 0;
     c->r[0] = 0;
     if (c->r[2] == 0 || c->r[2] == 2)
-      v = heap_mapped + linear_mapped;
+      v = heap_mapped + linear_mapped + image_bytes;
     else if (c->r[2] == 20)
       v = (u64)(s64)(s32)(0x20000000u - 0x30000000u);
     else
@@ -1060,8 +1174,8 @@ Ctx *trap_svc(Ctx *c) {
     for (int i = 0; i < 11 && user_ok(c->r[1] + (u32)i, 1); i++)
       if (!(name[i] = *(const char *)(uintptr_t)(c->r[1] + (u32)i)))
         break;
-    if (!strcmp(name, "srv:")) {
-      c->r[1] = session_new(&srv_service, NULL);
+    if (!strcmp(name, "srv:") || !strcmp(name, "err:f")) {
+      c->r[1] = session_new(name[0] == 's' ? &srv_service : &errf_service, NULL);
       c->r[0] = c->r[1] ? 0 : (u32)RES_OUT_OF_HANDLES;
     } else {
       log_printf("port %s: not there\n", name);
@@ -1113,9 +1227,9 @@ Ctx *trap_svc(Ctx *c) {
       u64 v = 0;
       if (num == 0x39) {
         static const u64 limits[10] = {0x18, 0, 32, 64, 32, 32, 8, 8, 16, 1000};
-        v = name == 1 ? (u64)(heap_size + linear_size) : (name < 10 ? limits[name] : 0);
+        v = name == 1 ? (u64)app_memory() : (name < 10 ? limits[name] : 0);
       } else {
-        v = name == 1 ? 0 : (name == 2 ? (u64)live_threads() : 0);
+        v = name == 1 ? (u64)(heap_mapped + linear_mapped + image_bytes) : (name == 2 ? (u64)live_threads() : 0);
       }
       wr32(c->r[0] + i * 8u, (u32)v);
       wr32(c->r[0] + i * 8u + 4u, (u32)(v >> 32));
@@ -1124,7 +1238,13 @@ Ctx *trap_svc(Ctx *c) {
     break;
   }
   case 0x3C:
-    log_printf("svcBreak(%u)\n", c->r[0]);
+    log_printf("svcBreak(%u), called from %08X\n", c->r[0], c->lr);
+    if (mmu_user_ok((c->lr & ~3u) - 16u, 32)) {
+      const u32 *w = (const u32 *)(uintptr_t)((c->lr & ~3u) - 16u);
+      log_printf("  code before the call: %08X %08X %08X %08X > %08X %08X %08X %08X\n", w[0], w[1], w[2], w[3],
+                 w[4], w[5], w[6], w[7]);
+    }
+    svc_ring_dump();
     svc_break(c, 3);
   case 0x3D: {
     u32 n = c->r[1] > 256u ? 256u : c->r[1];
@@ -1159,6 +1279,10 @@ Ctx *trap_svc(Ctx *c) {
     c->r[0] = (u32)RES_UNIMPL;
   }
   }
+  svc_ring[svc_ring_n & 7u].num = num;
+  svc_ring[svc_ring_n & 7u].result = c->r[0];
+  svc_ring[svc_ring_n & 7u].pc = c->pc;
+  svc_ring_n++;
   if (ticks() - job_start_tick > BUDGET_TICKS && cur && cur->state == TS_READY) {
     P->yield = YIELD_BUDGET;
     publish();
@@ -1201,6 +1325,10 @@ void trap_fault(u32 kind, Ctx *frame) {
   P->crash.fsr = fsr;
   P->crash.thread = cur ? cur->id : 0;
   P->crash.in_sup = (frame->cpsr & 0x1Fu) != 0x10u;
+  if (!P->crash.in_sup) {
+    crash_extras(frame->pc, frame->sp);
+    svc_ring_dump();
+  }
   P->yield = YIELD_CRASH;
   clock_stop();
   sup_yield();

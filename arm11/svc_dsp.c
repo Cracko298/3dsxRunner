@@ -1,8 +1,5 @@
 #include "sup.h"
 
-/* No DSP firmware runs here. We read libctru's NDSP commands out of shared
- * memory and mix them ourselves in software (layout per libctru's
- * ndsp-internal.h). PCM8/16 and mono DSP-ADPCM; no effects, no capture. */
 #define DSP_VA 0x1FF00000u
 #define BANK 0x10000u
 #define FRAME 160u
@@ -44,12 +41,15 @@ static s32 gain(float v) { return !(v > 0) ? 0 : v >= 4 ? 131072 : (s32)(v * 327
 static u32 samples_va(u32 pa, u32 bytes) {
   u32 va;
   if (!bytes || pa + bytes < pa) return 0;
-  if (pa >= linear_pa && pa - linear_pa < linear_size && bytes <= linear_size - (pa - linear_pa))
-    va = pa + LINEAR_DELTA;
-  else if (pa >= heap_pa && pa - heap_pa < heap_size && bytes <= heap_size - (pa - heap_pa))
+  if (pa >= linear_pa && pa - linear_pa < linear_avail && bytes <= linear_avail - (pa - linear_pa)) {
+    va = linear_va + (pa - linear_pa);
+    if (mmu_user_ok(va, bytes) && mmu_pa(va) == pa) return va;
+  }
+  if (pa >= heap_pa && pa - heap_pa < heap_avail && bytes <= heap_avail - (pa - heap_pa)) {
     va = VA_HEAP + pa - heap_pa;
-  else return 0;
-  return mmu_user_ok(va, bytes) && mmu_pa(va) == pa ? va : 0;
+    if (mmu_user_ok(va, bytes) && mmu_pa(va) == pa) return va;
+  }
+  return 0;
 }
 
 static void begin_buffer(Voice *v, Buffer b) {
@@ -258,12 +258,12 @@ static void dsp_request(Thread *t, Object *session, u32 *cmd) {
   case 0x15: {
     Object *o = cmd[4] ? handle_obj(cmd[4]) : NULL;
     if (cmd[4] && (!o || o->type != OBJ_EVENT)) { result = RES_INVALID_HANDLE; break; }
-    if (o) obj_ref(o);
+    if (o) obj_ref(o), o->who = "DSP interrupt";
     if (irq) obj_unref(irq);
     irq = o; break;
   }
   case 0x16: {
-    if (!semaphore) { semaphore = obj_new(OBJ_EVENT); if (semaphore) semaphore->refs = 1; }
+    if (!semaphore) { semaphore = obj_new(OBJ_EVENT); if (semaphore) semaphore->refs = 1, semaphore->who = "DSP semaphore"; }
     u32 h = handle_new(semaphore);
     cmd[0] = ipc_header(id, 1, 2); cmd[1] = h ? 0 : RES_OUT_OF_HANDLES; cmd[2] = 0; cmd[3] = h; return;
   }
@@ -282,9 +282,14 @@ static void dsp_request(Thread *t, Object *session, u32 *cmd) {
   }
   case 0x10: {
     u32 cap; u8 *out = (u8 *)static_buffer(t, 0, &cap);
-    u16 response[8] = {7, vars[0], vars[1], vars[2], vars[3], vars[4], vars[5], vars[6]};
+    u16 response[16] = {7, vars[0], vars[1], vars[2], vars[3], vars[4], vars[5], vars[6],
+                        0x2000, 0x2800, 0x3000, 0x3800, 0x4000, 0x4800, 0x5000, 0x5800};
+    u32 total = 16;
+    if (P->launch_flags & 4u) response[0] = 15;
+    else total = 8;
     if (!out || cmd[1] != 2) { result = RES_INVALID_ADDR; break; }
-    u32 n = cmd[3]; if (n > cap) n = cap; if (n > sizeof response - pipe_pos) n = sizeof response - pipe_pos;
+    u32 n = cmd[3]; if (n > cap) n = cap; if (pipe_pos > total * 2) pipe_pos = total * 2;
+    if (n > total * 2 - pipe_pos) n = total * 2 - pipe_pos;
     memcpy(out, (u8 *)response + pipe_pos, n); pipe_pos += n; value = n; break;
   }
   case 0xC: {

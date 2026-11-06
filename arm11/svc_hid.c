@@ -3,6 +3,16 @@
 static u32 *hid_mem, *irrst_mem;
 static Object *hid_block, *irrst_block;
 static Object *hid_events[5], *irrst_event;
+static bool accel_on, gyro_on;
+static void section_tick(u32 *s, u64 now);
+
+static void motion_section(u32 *sec, u64 now, s16 x, s16 y, s16 z) {
+  u32 idx = (sec[4] + 1u) & 7u;
+  s16 *e = (s16 *)(void *)&sec[6];
+  e[idx * 3] = x, e[idx * 3 + 1] = y, e[idx * 3 + 2] = z;
+  section_tick(sec, now);
+  sec[4] = idx;
+}
 
 #define KEY_TOUCH      (1u << 20)
 #define KEY_CPAD_RIGHT (1u << 28)
@@ -62,11 +72,32 @@ void hid_update(void) {
     for (int i = 0; i < 2; i++)
       if (hid_events[i])
         event_signal(hid_events[i]);
+    if (accel_on) {
+      motion_section(&hid_mem[66], now, 0, 0, -512);
+      if (hid_events[2]) event_signal(hid_events[2]);
+    }
+    if (gyro_on) {
+      motion_section(&hid_mem[86], now, 0, 0, 0);
+      if (hid_events[3]) event_signal(hid_events[3]);
+    }
   }
   if (irrst_mem) {
-    u32 idx = (irrst_mem[4] + 1u) & 7u;
+    u32 idx = (irrst_mem[4] + 1u) & 7u, prev = irrst_mem[6 + irrst_mem[4] * 4];
     u32 *e = &irrst_mem[6 + idx * 4];
-    e[0] = e[1] = e[2] = e[3] = 0;
+    s32 cx = P->new3ds ? P->cstick_x : 0, cy = P->new3ds ? P->cstick_y : 0;
+    u32 keys = 0;
+    if (P->new3ds) {
+      if (P->zlzr & 1u) keys |= 1u << 14;
+      if (P->zlzr & 2u) keys |= 1u << 15;
+      if (cx >= 41) keys |= 1u << 24;
+      if (cx <= -41) keys |= 1u << 25;
+      if (cy >= 41) keys |= 1u << 26;
+      if (cy <= -41) keys |= 1u << 27;
+    }
+    e[0] = keys;
+    e[1] = keys & ~prev;
+    e[2] = prev & ~keys;
+    e[3] = (u32)(u16)(s16)cx | (u32)(u16)(s16)cy << 16;
     section_tick(irrst_mem, now);
     irrst_mem[4] = idx;
     if (irrst_event)
@@ -84,7 +115,7 @@ static void hid_request(Thread *t, Object *session, u32 *cmd) {
       hid_block = block_for(&hid_mem);
       for (int i = 0; i < 5; i++)
         if ((hid_events[i] = obj_new(OBJ_EVENT)))
-          hid_events[i]->refs = 1;
+          hid_events[i]->refs = 1, hid_events[i]->who = "HID";
     }
     if (!hid_block) {
       cmd[0] = ipc_header(id, 1, 0);
@@ -104,6 +135,8 @@ static void hid_request(Thread *t, Object *session, u32 *cmd) {
   case 0x12:
   case 0x13:
   case 0x14:
+    if (id == 0x11 || id == 0x12) accel_on = id == 0x11;
+    else gyro_on = id == 0x13;
     cmd[0] = ipc_header(id, 1, 0);
     cmd[1] = 0;
     return;
@@ -112,6 +145,12 @@ static void hid_request(Thread *t, Object *session, u32 *cmd) {
     cmd[0] = ipc_header(id, 2, 0);
     cmd[1] = 0;
     cmd[2] = c.u;
+    return;
+  }
+  case 0x16: {
+    cmd[0] = ipc_header(id, 6, 0);
+    cmd[1] = 0;
+    for (int i = 2; i < 7; i++) cmd[i] = 0;
     return;
   }
   case 0x17:
@@ -133,7 +172,7 @@ static void irrst_request(Thread *t, Object *session, u32 *cmd) {
     if (!irrst_block) {
       irrst_block = block_for(&irrst_mem);
       if ((irrst_event = obj_new(OBJ_EVENT)))
-        irrst_event->refs = 1;
+        irrst_event->refs = 1, irrst_event->who = "ir:rst";
     }
     if (!irrst_block) {
       cmd[0] = ipc_header(id, 1, 0);
@@ -165,4 +204,5 @@ void hid_reset(void) {
   for (int i = 0; i < 5; i++)
     hid_events[i] = NULL;
   irrst_event = NULL;
+  accel_on = gyro_on = false;
 }

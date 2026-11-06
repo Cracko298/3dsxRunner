@@ -50,9 +50,27 @@ void ipc_unknown(const char *svc, u32 *cmd) {
   cmd[1] = 0;
 }
 
+static struct { u32 header, thread; const char *svc; } recent[8];
+static u32 recent_n;
+
+void ipc_recent(JobCrash *c) {
+  for (u32 i = 0; i < 8; i++) {
+    u32 k = (recent_n + i) & 7u;
+    c->recent[i].header = recent[k].header;
+    c->recent[i].thread = recent[k].thread;
+    memset(c->recent[i].svc, 0, 8);
+    if (recent[k].svc)
+      for (int j = 0; j < 8 && recent[k].svc[j]; j++) c->recent[i].svc[j] = recent[k].svc[j];
+  }
+}
+
 void ipc_session_request(Thread *t, Object *session) {
   u32 *cmd = cmd_buffer(t);
   const Service *svc = session->u.se.svc;
+  recent[recent_n & 7u].header = cmd[0];
+  recent[recent_n & 7u].thread = t->id;
+  recent[recent_n & 7u].svc = svc ? svc->name : "?";
+  recent_n++;
   if (!svc || !svc->request) {
     cmd[0] = ipc_header(cmd[0] >> 16, 1, 0);
     cmd[1] = RES_UNIMPL;
@@ -63,7 +81,7 @@ void ipc_session_request(Thread *t, Object *session) {
 
 static const Service *const known[] = {
     &apt_service, &gsp_service, &hid_service, &fs_service, &cfg_service, &ptm_service,
-    &irrst_service, &ac_service, &dsp_service, &http_service,
+    &irrst_service, &ac_service, &dsp_service, &mic_service, &iru_service, &http_service,
 };
 
 static bool name_is(const char *a, const char *b) {
@@ -127,6 +145,8 @@ static void srv_request(Thread *t, Object *session, u32 *cmd) {
     u32 len = cmd[3] > 8u ? 8u : cmd[3];
     memcpy(name, &cmd[1], len);
     const Service *s = service_find(name);
+    if (!s && (P->launch_flags & 4u))
+      s = retail_stub(name);
     if (!s) {
       log_printf("srv: no service \"%s\"\n", name);
       cmd[0] = ipc_header(0x5, 1, 0);

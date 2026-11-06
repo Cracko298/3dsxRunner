@@ -3,9 +3,6 @@
 extern u8 __bss_start[], __bss_end[];
 static bool loaded;
 
-/* The .3dsx file is mapped by whole megabytes, and that megabyte can be
- * shared with other ARM9 allocations. So the display mapping goes in only
- * after this one is gone. Order matters; I'm not happy about it either. */
 static void map_file(bool on) {
   u32 base = P->file_pa & ~0xFFFFFu;
   u32 size = ((P->file_pa + P->file_size + 0xFFFFFu) & ~0xFFFFFu) - base;
@@ -40,6 +37,8 @@ static void job_load(void) {
   P->yield = YIELD_NONE;
   P->error[0] = 0;
   P->log_head = 0;
+  P->trace_head = 0;
+  P->trace_pa = P->trace_size = 0;
   P->svc_count = P->ipc_count = P->gx_count = P->threads = 0;
   P->top.pa = P->bottom.pa = P->top_right_pa = 0;
   P->close_files = P->close_dirs = 0;
@@ -64,6 +63,8 @@ static void job_load(void) {
   fs_reset();
   misc_reset();
   dsp_reset();
+  mic_reset();
+  iru_reset();
   gpu_init();
   bool ok = load_3dsx();
   map_file(false);
@@ -104,6 +105,7 @@ void job_main(u32 arg) {
     job_run();
     break;
   case JOB_STOP:
+    if (loaded) wait_dump();
     gsp_gx_settle();
     gsp_report();
     gpu_report();
@@ -123,13 +125,13 @@ void job_main(u32 arg) {
     else P->mem.result=(s32)RES_UNIMPL;
     break;
   case JOB_OVERLAY_BEGIN:
-    if(loaded && P->plugin_enabled) dsp_overlay_pause(true);
+    if(loaded && (P->plugin_enabled || P->yield == YIELD_APPLET)) dsp_overlay_pause(true);
     break;
   case JOB_OVERLAY_FRAME:
-    if(loaded && P->plugin_enabled) gsp_overlay_frame();
+    if(loaded && (P->plugin_enabled || P->yield == YIELD_APPLET)) gsp_overlay_frame();
     break;
   case JOB_OVERLAY_END:
-    if(loaded && P->plugin_enabled) {
+    if(loaded && (P->plugin_enabled || P->yield == YIELD_APPLET)) {
       gsp_overlay_end();
       dsp_overlay_pause(false);
     }

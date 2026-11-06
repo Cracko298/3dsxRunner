@@ -3,8 +3,6 @@
 
 enum { EV_PSC0, EV_PSC1, EV_VBLANK0, EV_VBLANK1, EV_PPF, EV_P3D, EV_DMA };
 
-/* GSP's shared page: the interrupt queue at 0x000, framebuffer info at 0x200,
- * the GX command queue at 0x800. One client, thread index 0, always. */
 static u8 *shmem;
 static Object *shmem_block, *client_event;
 static u32 shmem_pa;
@@ -24,8 +22,6 @@ static bool rebase_logged;
 static u32 async_started, async_overlapped;
 static bool gx_sync(void) { return (P->launch_flags & 2u) != 0; }
 
-/* Only the New 3DS layout puts the linear heap past 0x28000000, so only it
- * needs the vertex rebase (see pica_rebase.h for the whole sad story). */
 static bool rebase_wanted(void) {
   return (u64)P->linear.pa + P->linear.size > PICA_REBASE_TARGET;
 }
@@ -83,8 +79,6 @@ static void trace_first_list(const u32 *w,u32 bytes) {
 #define TOP_BYTES (400u * 720u)
 #define BOT_BYTES (320u * 720u)
 
-/* Each screen cycles through its own three buffers, so if the game only
- * redraws the top screen we don't copy (or wait on) the bottom one. */
 static u32 display_slot[2];
 _Static_assert(TOP_BYTES+BOT_BYTES<=DISPLAY_SLOT_SIZE,"both panels fit a display slot");
 
@@ -104,8 +98,6 @@ static void interrupt(int ev) {
     event_signal(client_event);
 }
 
-/* libctru flips the "update" byte when it presents; real GSP picks it up at
- * vblank. We pick it up whenever we get control, which is close enough. */
 static void latch(int screen) {
   if (!shmem)
     return;
@@ -203,9 +195,6 @@ static void convert(u8 *dst, u32 src, u32 fmt, u32 stride, int columns, int step
   }
 }
 
-/* Yes, even native BGR8 gets copied. libctru can start reusing its front
- * buffer before the LCD is done reading it, and that's how you get tearing
- * and the "two frames glued together" look from r3-r5. */
 static void picture(int screen, u8 *dst) {
   const Shown *s=&shown[screen];
   if (!s->valid) { memset(dst,0,screen?BOT_BYTES:TOP_BYTES); return; }
@@ -260,8 +249,6 @@ void gsp_present(void) {
   P->top_right_pa=0;
 }
 
-/* A bad buffer kills the game with a message instead of faking success.
- * Faking it once cost me a week of staring at "frozen" screens. */
 static u32 gpu_addr(u32 va, u32 size, bool output) {
   u32 pa = size ? contiguous(va, size) : 0;
   if (!pa || (pa&7u) || (output && !mmu_user_write_ok(va,size))) {
@@ -273,9 +260,6 @@ static u32 gpu_addr(u32 va, u32 size, bool output) {
   return pa;
 }
 
-/* citro3d passes the unscaled size on both sides; the hardware halves the
- * output for anti-aliasing. Check the halved size or valid buffers at the end
- * of a region get rejected. */
 static u32 dim_bytes(u32 dim, u32 flags, bool out) {
   u32 w = dim & 0xFFFFu, h = dim >> 16;
   u32 fmt = out ? (flags >> 12) & 7u : (flags >> 8) & 7u;
@@ -295,18 +279,6 @@ static u32 copy_span(u32 size,u32 dim) {
   return span<=0xFFFFFFFFu?(u32)span:0;
 }
 
-/* Asynchronous GX.
- *
- * We used to run each GPU command to completion inside the game's GSP call,
- * which meant the ARM11 sat there twiddling its thumbs while the GPU drew.
- * Now we start the command and let the game get on with its life (citro3d
- * happily builds the next frame meanwhile). We check on the GPU at every
- * kernel call and job entry, and only busy-wait when every game thread is
- * blocked anyway, which is exactly what we did before. So worst case it's
- * r14, best case the CPU and GPU finally work at the same time.
- *
- * One command at a time, in order, like the real GSP. If this ever breaks a
- * game, sync-gx.txt on the SD card turns it all off. */
 enum { ENG_PSC0 = 1, ENG_PSC1 = 2, ENG_PPF = 4, ENG_P3D = 8 };
 static struct { u32 c[8]; u32 engines; u64 start; } fly;
 bool gsp_gx_inflight;
@@ -471,8 +443,6 @@ void gsp_gx_drain(void) {
   while (gsp_gx_inflight) gsp_gx_wait();
 }
 
-/* On STOP, give a running command a chance to finish before we hand the
- * display and GPU config back. No cancel checks here: STOP has to complete. */
 void gsp_gx_settle(void) {
   for (u32 polls=0; gsp_gx_inflight && polls<8000000u; polls++)
     gx_check();
@@ -540,6 +510,7 @@ static void gsp_request(Thread *t, Object *session, u32 *cmd) {
     if (client_event)
       obj_unref(client_event);
     client_event = ev;
+    ev->who = "GSP interrupts";
     obj_ref(ev);
     u32 h = handle_new(shmem_block);
     cmd[0] = ipc_header(id, 2, 2);
@@ -629,8 +600,6 @@ void gsp_reset(void) {
   serial[0] = serial[1] = 0;
 }
 
-/* The cheat overlay draws into our private snapshot buffers with the CPU.
- * It never touches game VRAM, because the old overlay did, and that was bad. */
 void gsp_overlay_frame(void) {
   const u32 alias=0x1D800000u;
   if(!mmu_map(alias,0x23E80000u,0x100000u,MAP_PRIV|MAP_RO))

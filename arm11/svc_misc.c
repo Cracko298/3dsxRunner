@@ -1,4 +1,5 @@
 #include "sup.h"
+#include "applet.h"
 
 static void ok(u32 *cmd, u32 id, u32 normal) {
   cmd[0] = ipc_header(id, normal, 0);
@@ -10,11 +11,6 @@ static void ok(u32 *cmd, u32 id, u32 normal) {
 static Object *apt_lock, *font_block;
 static bool font_tried;
 
-/* The system font is built from Aurora's font through temporary private
- * aliases, which get unmapped afterwards. r6 mapped whole megabytes at their
- * real addresses instead, and cleaning those up also unmapped part of the
- * display pool. YAMKC then crashed on the very next frame copy. I still
- * think about that one at night. */
 static Object *shared_font(void) {
   if (font_block || font_tried)
     return font_block;
@@ -59,7 +55,6 @@ static Object *shared_font(void) {
 }
 
 static void apt_request(Thread *t, Object *session, u32 *cmd) {
-  (void)t;
   (void)session;
   u32 id = cmd[0] >> 16;
   switch (id) {
@@ -74,11 +69,35 @@ static void apt_request(Thread *t, Object *session, u32 *cmd) {
   }
   case 0x2: {
     Object *a = obj_new(OBJ_EVENT), *b = obj_new(OBJ_EVENT);
+    if (a) a->who = "APT notification";
+    if (b) b->who = "APT resume";
     ok(cmd, id, 1);
     cmd[0] = ipc_header(id, 1, 3);
     cmd[2] = 1u << 26;
     cmd[3] = handle_new(a);
     cmd[4] = handle_new(b);
+    if (b) { obj_ref(b); applet_set_resume_event(b); }
+    return;
+  }
+  case 0x3:
+    ok(cmd, id, 1);
+    if (P->launch_flags & 4u) applet_launch_wakeup();
+    return;
+  case 0x9:
+    ok(cmd, id, 2);
+    cmd[2] = applet_is_library(cmd[1]) ? 1u : 0u;
+    return;
+  case 0x0C:
+    applet_send(cmd[2], cmd[3]);
+    ok(cmd, id, 1);
+    return;
+  case 0x1E: {
+    u32 appid = cmd[1], size = cmd[2], buf = cmd[6];
+    Object *mem = cmd[4] ? handle_obj(cmd[4]) : NULL;
+    const void *data = size && mmu_user_ok(buf, size) ? (const void *)(uintptr_t)buf : NULL;
+    if (applet_start(t, appid, data, data ? size : 0, mem && mem->type == OBJ_MEMBLOCK ? mem : NULL))
+      return;
+    ok(cmd, id, 1);
     return;
   }
   case 0x58:
@@ -110,10 +129,29 @@ static void apt_request(Thread *t, Object *session, u32 *cmd) {
     return;
   }
   case 0x0D:
-  case 0x0E:
-    cmd[0] = ipc_header(id, 1, 0);
-    cmd[1] = 0xC8A0CFF0u;
+  case 0x0E: {
+    u32 sender, command, size, cap;
+    const u8 *data;
+    if (!applet_take(id == 0x0D, &sender, &command, &data, &size)) {
+      cmd[0] = ipc_header(id, 1, 0);
+      cmd[1] = 0xC8A0CFF0u;
+      return;
+    }
+    u32 *out = static_buffer(t, 0, &cap);
+    if (!out) cap = 0;
+    if (size > cap) size = cap;
+    if (size) memcpy(out, data, size);
+    cmd[0] = ipc_header(id, 4, 4);
+    cmd[1] = 0;
+    cmd[2] = sender;
+    cmd[3] = command;
+    cmd[4] = size;
+    cmd[5] = 0x10u;
+    cmd[6] = 0;
+    cmd[7] = (size << 14) | 2u;
+    cmd[8] = (u32)(uintptr_t)out;
     return;
+  }
   case 0x2C:
   case 0x4E:
   case 0x32:
@@ -166,6 +204,12 @@ static void cfg_block(u32 blk, u8 *out, u32 size) {
   case 0x000F0004:
     out[0] = P->new3ds ? 2 : 0;
     break;
+  case 0x00050005: {
+    static const float stereo[8] = {62.0f, 289.0f, 76.80000305175781f, 46.08000183105469f,
+                                    10.0f, 5.0f, 55.58000183105469f, 21.56999969482422f};
+    memcpy(out, stereo, size < sizeof stereo ? size : sizeof stereo);
+    break;
+  }
   default: {
     static u32 seen[16];
     for (int i = 0; i < 16; i++) {
@@ -301,6 +345,7 @@ static void ac_request(Thread *t, Object *session, u32 *cmd) {
   }
   case 4:
     ac_event=handle_obj(cmd[4]);
+    if (ac_event) ac_event->who = "ac (Wi-Fi)";
     if (!ac_event || ac_event->type!=OBJ_EVENT) {
       ac_event=NULL; cmd[0]=ipc_header(id,1,0); cmd[1]=RES_INVALID_HANDLE; return;
     }
@@ -321,9 +366,49 @@ static void ac_request(Thread *t, Object *session, u32 *cmd) {
 
 const Service ac_service = {"ac:u", ac_request, NULL};
 
+static void errf_request(Thread *t, Object *session, u32 *cmd) {
+  (void)t; (void)session;
+  u32 id = cmd[0] >> 16;
+  if (id == 1) {
+    static const char *const kinds[] = {"generic", "corrupted", "card removed", "exception",
+                                        "result failure", "logged"};
+    u32 kind = cmd[1] & 0xFFu;
+    char msg[0x61];
+    u32 n = 0;
+    const u8 *m = (const u8 *)&cmd[9];
+    if (kind == 0 || kind == 4 || kind == 5)
+      for (; n < 0x60 && m[n] >= 0x20 && m[n] < 0x7F; n++) msg[n] = (char)m[n];
+    msg[n] = 0;
+    log_printf("err:f: fatal %s error, result %08X at PC %08X%s%s\n", kind < 6 ? kinds[kind] : "unknown",
+               cmd[2], cmd[3], n ? ": " : "", msg);
+    snprintf(P->error, sizeof P->error, "the game reported fatal error %08X at %08X", cmd[2], cmd[3]);
+  }
+  cmd[0] = ipc_header(id, 1, 0);
+  cmd[1] = 0;
+}
+const Service errf_service = {"err:f", errf_request, NULL};
+
 static void stub_request(Thread *t, Object *session, u32 *cmd) {
   (void)t;
   ipc_unknown(session->u.se.svc->name, cmd);
+}
+
+#define RETAIL_STUBS 24
+static char stub_names[RETAIL_STUBS][9];
+static Service retail_stubs[RETAIL_STUBS];
+
+const Service *retail_stub(const char *name) {
+  for (int i = 0; i < RETAIL_STUBS; i++) {
+    if (retail_stubs[i].name && !strcmp(stub_names[i], name)) return &retail_stubs[i];
+    if (!retail_stubs[i].name) {
+      memcpy(stub_names[i], name, 8);
+      stub_names[i][8] = 0;
+      retail_stubs[i] = (Service){stub_names[i], stub_request, NULL};
+      log_printf("srv: \"%s\" isn't here; answering OK\n", stub_names[i]);
+      return &retail_stubs[i];
+    }
+  }
+  return NULL;
 }
 
 const Service stub_services[] = {
@@ -338,6 +423,8 @@ const Service stub_services[] = {
 };
 
 void misc_reset(void) {
+  applet_reset();
+  memset(retail_stubs, 0, sizeof retail_stubs);
   apt_lock = font_block = NULL;
   font_tried = false;
 }

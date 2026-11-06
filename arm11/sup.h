@@ -85,6 +85,7 @@ typedef struct Service Service;
 struct Object {
   u8 type, used;
   u16 refs;
+  const char *who;
   union {
     struct { u8 signaled, reset; } ev;
     struct { Thread *owner; u32 count; } mx;
@@ -92,7 +93,7 @@ struct Object {
     struct { u8 signaled, reset, armed; u64 next, interval; } tm;
     struct { Thread *t; } th;
     struct { const Service *svc; u32 data[6]; } se;
-    struct { u32 pa, size, va; u8 kind; } mb;
+    struct { u32 pa, size, va, cva; u8 kind; } mb;
     struct { const Service *svc; } port;
   } u;
 };
@@ -106,7 +107,7 @@ struct Thread {
   Ctx ctx;
   u8 state, wait, wall, nw;
   s32 prio, core;
-  u32 id, order;
+  u32 id, order, entry;
   Object *obj;
   Object *wobj[MAX_WAIT];
   u32 waddr;
@@ -188,6 +189,8 @@ Ctx *trap_svc(Ctx *c);
 void trap_fault(u32 kind, Ctx *frame);
 Ctx *trap_irq(Ctx *c);
 void log_printf(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
+void trace_printf(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
+bool tracing(void);
 void sup_fail(const char *why) __attribute__((noreturn));
 void job_check_cancel(void);
 void gpu_abort_transfers(void);
@@ -202,9 +205,10 @@ const Service *service_find(const char *name);
 void ipc_unknown(const char *svc, u32 *cmd);
 void ipc_reset(void);
 u32 *static_buffer(Thread *t, u32 index, u32 *size);
+const Service *retail_stub(const char *name);
 
 extern const Service srv_service, apt_service, gsp_service, hid_service, fs_service,
-    cfg_service, ptm_service, irrst_service, ac_service, dsp_service, http_service, stub_services[];
+    cfg_service, ptm_service, irrst_service, ac_service, dsp_service, mic_service, iru_service, http_service, stub_services[];
 extern const Service fs_file_service, fs_dir_service;
 void gsp_vblank(void);
 void gsp_framebuffers(void);
@@ -232,6 +236,15 @@ void hid_reset(void);
 void fs_reset(void);
 void misc_reset(void);
 void dsp_reset(void);
+void mic_reset(void);
+void iru_reset(void);
+extern const Service errf_service;
+void ipc_recent(JobCrash *c);
+void crash_extras(u32 pc, u32 sp);
+u32 app_memory(void);
+extern u32 linear_low, image_bytes;
+void svc_ring_dump(void);
+void wait_dump(void);
 void dsp_stop(void);
 void dsp_tick(u64 now);
 u64 dsp_deadline(void);
